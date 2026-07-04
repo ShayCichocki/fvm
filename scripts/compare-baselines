@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FVM="${FVM:-$ROOT/target/release/fvm}"
+FVM_RUNNER="${FVM_RUNNER:-$ROOT/scripts/fvm-docker}"
+JAR="${JAR:-$ROOT/examples/perf-http/perf-app.jar}"
+ARTIFACT="${ARTIFACT:-$ROOT/examples/perf-http/perf-app.fvm}"
+NATIVE_BIN="${NATIVE_BIN:-$ARTIFACT/app.bin}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-fvm-dev}"
+ITERATIONS="${ITERATIONS:-10}"
+BASE_PORT="${BASE_PORT:-18100}"
+GUEST_PORT="${GUEST_PORT:-8080}"
+SNAPSHOT_NAME="${SNAPSHOT_NAME:-initialized}"
+RESULT_DIR="${RESULT_DIR:-$ROOT/perf-results/compare-$(date +%Y%m%d-%H%M%S)}"
+WORK_JAR="/work/${JAR#"$ROOT/"}"
+WORK_NATIVE_BIN="/work/${NATIVE_BIN#"$ROOT/"}"
+if [[ "$ARTIFACT" == "$ROOT/"* ]]; then
+  DEFAULT_FVM_ARTIFACT_ARG="/work/${ARTIFACT#"$ROOT/"}"
+else
+  DEFAULT_FVM_ARTIFACT_ARG="$ARTIFACT"
+fi
+FVM_ARTIFACT_ARG="${FVM_ARTIFACT_ARG:-$DEFAULT_FVM_ARTIFACT_ARG}"
+
+mkdir -p "$RESULT_DIR"
+
+if [[ ! -f "$JAR" ]]; then
+  echo "missing JAR: $JAR" >&2
+  exit 1
+fi
+
+if [[ ! -x "$NATIVE_BIN" ]]; then
+  echo "missing native binary: $NATIVE_BIN" >&2
+  exit 1
+fi
+
+ms_now() {
+  date +%s%3N
+}
+
+rss_kib() {
+  local pid="$1"
+  awk '/^VmRSS:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null || true
+}
+
+docker_mem_kib() {
+  local container="$1"
+  local usage
+  usage="$(docker stats --no-stream --format '{{.MemUsage}}' "$container" 2>/dev/null | awk '{print $1}')"
+  awk -v usage="$usage" 'BEGIN {
+    value = usage
+    if (value ~ /KiB$/) { sub(/KiB$/, "", value); printf "%.0f\n", value; exit }
+    if (value ~ /MiB$/) { sub(/MiB$/, "", value); printf "%.0f\n", value * 1024; exit }
+    if (value ~ /GiB$/) { sub(/GiB$/, "", value); printf "%.0f\n", value * 1024 * 1024; exit }
+    if (value ~ /B$/) { sub(/B$/, "", value); printf "%.0f\n", value / 1024; exit }
+    print 0
+  }'
+}
+
+wait_health() {
+  local port="$1"
+  local deadline=$((SECONDS + 30))
+  while (( SECONDS < deadline )); do
+    if curl -fsS --max-time 0.25 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.025
+  done
+  return 1
+}
+
+bench_process() {
+  local name="$1"
+  local port="$2"
+  shift 2
+  local out="$RESULT_DIR/$name.tsv"
+  : >"$out"
+
+  for i in $(seq 1 "$ITERATIONS"); do
+    local log="$RESULT_DIR/$name-$i.log"
+    local start end pid rss
+    start="$(ms_now)"
+    PORT="$port" "$@" >"$log" 2>&1 &
+    pid="$!"
+
+    if ! wait_health "$port"; then
+      kill "$pid" >/dev/null 2>&1 || true
+      wait "$pid" >/dev/null 2>&1 || true
+      echo "$name failed readiness in iteration $i; see $log" >&2
+      exit 1
+    fi
+
+    end="$(ms_now)"
+    sleep 0.1
+    rss="$(rss_kib "$pid")"
+    printf '%s\t%s\t%s\n' "$i" "$((end - start))" "${rss:-0}" >>"$out"
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+    sleep 0.2
+  done
+}
+
+bench_docker() {
+  local name="$1"
+  local port="$2"
+  local entrypoint="$3"
+  shift 3
+  local out="$RESULT_DIR/$name.tsv"
+  : >"$out"
+
+  for i in $(seq 1 "$ITERATIONS"); do
+    local log="$RESULT_DIR/$name-$i.log"
+    local container="fvm-${name}-${i}-$$"
+    local start end rss
+    start="$(ms_now)"
+    docker run -d --rm \
+      --name "$container" \
+      --network host \
+      -e PORT="$port" \
+      -v "$ROOT:/work" \
+      -w /work \
+      --entrypoint "$entrypoint" \
+      "$DOCKER_IMAGE" \
+      "$@" >"$log" 2>&1
+
+    if ! wait_health "$port"; then
+      docker logs "$container" >>"$log" 2>&1 || true
+      docker stop -t 1 "$container" >/dev/null 2>&1 || true
+      echo "$name failed readiness in iteration $i; see $log" >&2
+      exit 1
+    fi
+
+    end="$(ms_now)"
+    sleep 0.1
+    rss="$(docker_mem_kib "$container")"
+    printf '%s\t%s\t%s\n' "$i" "$((end - start))" "${rss:-0}" >>"$out"
+    docker stop -t 1 "$container" >/dev/null 2>&1 || true
+    sleep 0.2
+  done
+}
+
+bench_fvm() {
+  local name="$1"
+  local port="$2"
+  local snapshot="$3"
+  local out="$RESULT_DIR/$name.tsv"
+  : >"$out"
+
+  for i in $(seq 1 "$ITERATIONS"); do
+    local log="$RESULT_DIR/$name-$i.log"
+    local boot rss
+    local args=(run "$FVM_ARTIFACT_ARG" --once --port "$port:$GUEST_PORT" --wait-http /health --readiness-timeout 45 --benchmark-iterations 1 --no-record-benchmark)
+    if [[ -n "$snapshot" ]]; then
+      args=(run "$FVM_ARTIFACT_ARG" --snapshot "$snapshot" --once --port "$port:$GUEST_PORT" --wait-http /health --readiness-timeout 45 --benchmark-iterations 1 --no-record-benchmark)
+    fi
+
+    "$FVM_RUNNER" "${args[@]}" >"$log" 2>&1
+    boot="$(grep 'boot_to_listen_ms' "$log" | sed -E 's/.*Some\(([0-9]+)\).*/\1/' | tail -n 1)"
+    rss="$(grep 'host_rss_kib' "$log" | sed -E 's/.*Some\(([0-9]+)\).*/\1/' | tail -n 1)"
+    if [[ -z "$boot" || -z "$rss" ]]; then
+      echo "$name failed to produce metrics in iteration $i; see $log" >&2
+      exit 1
+    fi
+    printf '%s\t%s\t%s\n' "$i" "$boot" "$rss" >>"$out"
+    sleep 0.2
+  done
+}
+
+summary() {
+  local name="$1"
+  local file="$RESULT_DIR/$name.tsv"
+  local n median_idx p90_idx p99_idx median p90 p99 rssmax
+  n="$(wc -l <"$file")"
+  if [[ "$n" -eq 0 ]]; then
+    echo "no samples for $name" >&2
+    exit 1
+  fi
+  median_idx=$(((n * 50 + 99) / 100))
+  p90_idx=$(((n * 90 + 99) / 100))
+  p99_idx=$(((n * 99 + 99) / 100))
+  median="$(cut -f2 "$file" | sort -n | sed -n "${median_idx}p")"
+  p90="$(cut -f2 "$file" | sort -n | sed -n "${p90_idx}p")"
+  p99="$(cut -f2 "$file" | sort -n | sed -n "${p99_idx}p")"
+  rssmax="$(cut -f3 "$file" | sort -n | sed -n "${n}p")"
+  {
+    printf "%s_iterations=%d\n" "$name" "$n"
+    printf "%s_boot_median_ms=%d\n" "$name" "$median"
+    printf "%s_boot_p90_ms=%d\n" "$name" "$p90"
+    printf "%s_boot_p99_ms=%d\n" "$name" "$p99"
+    printf "%s_rss_max_kib=%d\n" "$name" "$rssmax"
+    awk -v name="$name" -v rss="$rssmax" 'BEGIN { printf "%s_rss_max_mib=%.2f\n", name, rss / 1024 }'
+  } | tee "$RESULT_DIR/$name-summary.env"
+}
+
+echo "result_dir=$RESULT_DIR"
+echo "iterations=$ITERATIONS"
+echo "docker_image=$DOCKER_IMAGE"
+
+bench_process host_jvm "$BASE_PORT" java -jar "$JAR"
+summary host_jvm
+
+bench_process host_native "$((BASE_PORT + 1))" "$NATIVE_BIN"
+summary host_native
+
+if command -v docker >/dev/null 2>&1; then
+  bench_docker docker_jvm "$((BASE_PORT + 2))" java -jar "$WORK_JAR"
+  summary docker_jvm
+
+  bench_docker docker_native "$((BASE_PORT + 3))" "$WORK_NATIVE_BIN"
+  summary docker_native
+fi
+
+if [[ -x "$FVM_RUNNER" && -f "$ARTIFACT/metadata.json" ]]; then
+  bench_fvm fvm_cold "$((BASE_PORT + 4))" ""
+  summary fvm_cold
+
+  if [[ -f "$ARTIFACT/snapshots/$SNAPSHOT_NAME.mem" && -f "$ARTIFACT/snapshots/$SNAPSHOT_NAME.vmstate" ]]; then
+    bench_fvm fvm_snapshot "$((BASE_PORT + 5))" "$SNAPSHOT_NAME"
+    summary fvm_snapshot
+  fi
+fi
+
+if [[ -f "$ARTIFACT/metadata.json" && -x "$FVM" ]]; then
+  if ! "$FVM" math "$ARTIFACT" --host-memory 32G --reserve 2G --baseline-host-rss 256M --baseline-boot-ms 5000 \
+    | tee "$RESULT_DIR/fvm-math.txt"; then
+    echo "fvm math skipped; artifact has no recorded benchmark data" | tee "$RESULT_DIR/fvm-math.txt"
+  fi
+fi
+
+cat "$RESULT_DIR"/*-summary.env >"$RESULT_DIR/baselines.env"
+
+echo "wrote results to $RESULT_DIR"

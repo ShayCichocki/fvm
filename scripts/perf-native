@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FVM="${FVM:-$ROOT/target/release/fvm}"
+APP_DIR="$ROOT/examples/perf-http"
+BUILD_DIR="$APP_DIR/build"
+GEN_SRC="$BUILD_DIR/generated-src"
+CLASSES="$BUILD_DIR/classes"
+RESOURCES="$BUILD_DIR/resources"
+JAR="$APP_DIR/perf-app.jar"
+ARTIFACT="$APP_DIR/perf-app.fvm"
+KERNEL="${FVM_KERNEL:-$ROOT/.fvm-host-bin/hello-vmlinux.bin}"
+HOST_PORT="${HOST_PORT:-18081}"
+GUEST_PORT="${GUEST_PORT:-8080}"
+ITERATIONS="${ITERATIONS:-10}"
+ROOTFS_SIZE="${ROOTFS_SIZE:-64M}"
+HOST_MEMORY="${HOST_MEMORY:-32G}"
+RESERVE="${RESERVE:-2G}"
+BASELINE_HOST_RSS="${BASELINE_HOST_RSS:-256M}"
+BASELINE_BOOT_MS="${BASELINE_BOOT_MS:-5000}"
+RESULT_DIR="${RESULT_DIR:-$ROOT/perf-results/$(date +%Y%m%d-%H%M%S)}"
+
+export LIBRARY_PATH="$HOME/.local/lib:${LIBRARY_PATH:-}"
+
+mkdir -p "$RESULT_DIR" "$GEN_SRC/perf/gen" "$CLASSES" "$RESOURCES"
+
+if [[ ! -x "$FVM" ]]; then
+  echo "missing fvm binary: $FVM" >&2
+  echo "run: cargo build --release" >&2
+  exit 1
+fi
+
+if [[ ! -f "$KERNEL" ]]; then
+  echo "missing kernel: $KERNEL" >&2
+  echo "set FVM_KERNEL=/path/to/firecracker/kernel" >&2
+  exit 1
+fi
+
+ms_now() {
+  date +%s%3N
+}
+
+measure() {
+  local name="$1"
+  shift
+  local log="$RESULT_DIR/$name.log"
+  local start end elapsed
+  start="$(ms_now)"
+  "$@" >"$log" 2>&1
+  end="$(ms_now)"
+  elapsed=$((end - start))
+  printf "%s_ms=%s\n" "$name" "$elapsed" | tee -a "$RESULT_DIR/timings.env"
+}
+
+size_line() {
+  local key="$1"
+  local path="$2"
+  if [[ -e "$path" ]]; then
+    printf "%s_bytes=%s\n" "$key" "$(stat -c%s "$path")" | tee -a "$RESULT_DIR/sizes.env"
+  fi
+}
+
+generate_sources() {
+  rm -rf "$GEN_SRC" "$CLASSES" "$RESOURCES"
+  mkdir -p "$GEN_SRC/perf/gen" "$CLASSES" "$RESOURCES"
+
+  for i in $(seq -w 1 160); do
+    cat >"$GEN_SRC/perf/gen/GeneratedUnit$i.java" <<JAVA
+package perf.gen;
+
+public final class GeneratedUnit$i {
+    private static final String LABEL = "unit-$i:abcdefghijklmnopqrstuvwxyz:0123456789:THE_QUICK_BROWN_FOX";
+
+    public static int value(int seed) {
+        int value = seed ^ 0x$i;
+        for (int i = 0; i < LABEL.length(); i++) {
+            value = Integer.rotateLeft(value + LABEL.charAt(i) * (i + 17), 3);
+        }
+        return value;
+    }
+
+    public static String label() {
+        return LABEL;
+    }
+}
+JAVA
+  done
+
+  {
+    printf 'package perf.gen;\n\npublic final class GeneratedRegistry {\n'
+    printf '    private GeneratedRegistry() {}\n\n'
+    printf '    public static int checksum() {\n        int value = 17;\n'
+    for i in $(seq -w 1 160); do
+      printf '        value = 31 * value + GeneratedUnit%s.value(value);\n' "$i"
+    done
+    printf '        return value;\n    }\n\n'
+    printf '    public static int mix(int seed) {\n        int value = seed;\n'
+    for i in $(seq -w 1 160); do
+      printf '        value ^= GeneratedUnit%s.value(value);\n' "$i"
+    done
+    printf '        return value;\n    }\n\n'
+    printf '    public static String[] labels() {\n        return new String[] {\n'
+    for i in $(seq -w 1 160); do
+      printf '            GeneratedUnit%s.label(),\n' "$i"
+    done
+    printf '        };\n    }\n}\n'
+  } >"$GEN_SRC/perf/gen/GeneratedRegistry.java"
+
+  for i in $(seq 1 25000); do
+    printf 'payload-line-%05d %s %s\n' "$i" "$(printf '%064d' "$i")" "fvm-native-benchmark"
+  done >"$RESOURCES/payload.txt"
+}
+
+compile_app() {
+  javac --release 25 \
+    -d "$CLASSES" \
+    "$APP_DIR/src/PerfApp.java" \
+    $(find "$GEN_SRC" -name '*.java' -print)
+  jar --create --file "$JAR" --main-class PerfApp -C "$CLASSES" . -C "$RESOURCES" .
+}
+
+fvm_build() {
+  "$FVM" build "$JAR" \
+    --force \
+    --output "$ARTIFACT" \
+    --kernel "$KERNEL" \
+    --port "$HOST_PORT:$GUEST_PORT" \
+    --rootfs-size "$ROOTFS_SIZE" \
+    --native-image-arg=--add-modules=jdk.httpserver \
+    --native-image-arg=-H:IncludeResources=payload.txt
+}
+
+fvm_cold() {
+  "$FVM" run "$ARTIFACT" \
+    --once \
+    --port "$HOST_PORT:$GUEST_PORT" \
+    --wait-http /health \
+    --readiness-timeout 45 \
+    --benchmark-iterations "$ITERATIONS"
+}
+
+fvm_snapshot() {
+  "$FVM" snapshot "$ARTIFACT" \
+    --name initialized \
+    --wait-http /health \
+    --port "$HOST_PORT:$GUEST_PORT" \
+    --readiness-timeout 45 \
+    --verify-restore
+}
+
+fvm_restore() {
+  "$FVM" run "$ARTIFACT" \
+    --snapshot initialized \
+    --once \
+    --port "$HOST_PORT:$GUEST_PORT" \
+    --wait-http /health \
+    --readiness-timeout 45 \
+    --benchmark-iterations "$ITERATIONS"
+}
+
+rm -f "$RESULT_DIR/timings.env" "$RESULT_DIR/sizes.env"
+
+echo "result_dir=$RESULT_DIR"
+"$FVM" doctor --strict | tee "$RESULT_DIR/doctor.log"
+
+measure generate_sources generate_sources
+measure compile_app compile_app
+size_line jar "$JAR"
+
+measure fvm_build fvm_build
+size_line artifact_app_bin "$ARTIFACT/app.bin"
+size_line artifact_rootfs "$ARTIFACT/rootfs.ext4"
+size_line artifact_kernel "$ARTIFACT/kernel"
+du -sm "$ARTIFACT" | awk '{print "artifact_du_mib=" $1}' | tee -a "$RESULT_DIR/sizes.env"
+
+measure cold_benchmark fvm_cold
+"$FVM" math "$ARTIFACT" \
+  --host-memory "$HOST_MEMORY" \
+  --reserve "$RESERVE" \
+  --baseline-host-rss "$BASELINE_HOST_RSS" \
+  --baseline-boot-ms "$BASELINE_BOOT_MS" | tee "$RESULT_DIR/cold-math.txt"
+
+measure snapshot_create fvm_snapshot
+size_line snapshot_mem "$ARTIFACT/snapshots/initialized.mem"
+size_line snapshot_vmstate "$ARTIFACT/snapshots/initialized.vmstate"
+
+measure snapshot_restore_benchmark fvm_restore
+"$FVM" math "$ARTIFACT" \
+  --host-memory "$HOST_MEMORY" \
+  --reserve "$RESERVE" \
+  --baseline-host-rss "$BASELINE_HOST_RSS" \
+  --baseline-boot-ms "$BASELINE_BOOT_MS" | tee "$RESULT_DIR/snapshot-math.txt"
+
+"$FVM" inspect "$ARTIFACT" --verify | tee "$RESULT_DIR/inspect.txt"
+
+echo "wrote results to $RESULT_DIR"

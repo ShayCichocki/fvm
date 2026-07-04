@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${FVM_DOCKER_IMAGE:-fvm-dev}"
+
+if [[ "${1:-}" == "build-image" ]]; then
+  docker build -f "$ROOT/docker/fvm-runner.Dockerfile" -t "$IMAGE" "$ROOT"
+  exit 0
+fi
+
+firecracker_mount=()
+if command -v firecracker >/dev/null 2>&1; then
+  firecracker_bin="$(command -v firecracker)"
+  mkdir -p "$ROOT/.fvm-host-bin"
+  cp "$firecracker_bin" "$ROOT/.fvm-host-bin/firecracker"
+  chmod +x "$ROOT/.fvm-host-bin/firecracker"
+  firecracker_mount=(-v "$ROOT/.fvm-host-bin/firecracker:/usr/local/bin/firecracker:ro")
+fi
+
+tty_args=()
+if [[ -t 0 && -t 1 ]]; then
+  tty_args=(-it)
+fi
+
+env_args=()
+for name in FVM_TRACE_READINESS; do
+  if [[ -n "${!name:-}" ]]; then
+    env_args+=(-e "$name")
+  fi
+done
+
+docker run --rm "${tty_args[@]}" \
+  --privileged \
+  --device /dev/kvm \
+  --device /dev/net/tun \
+  --cap-add NET_ADMIN \
+  --network host \
+  -v "$ROOT:/work" \
+  -w /work \
+  "${env_args[@]}" \
+  "${firecracker_mount[@]}" \
+  "$IMAGE" \
+  "$@"
