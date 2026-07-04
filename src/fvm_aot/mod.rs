@@ -1,10 +1,18 @@
 use anyhow::{Context, Result, bail};
 mod classfile;
+mod diagnostics;
+mod types;
 use classfile::{ClassFile, Constant, Field, Method, ResolvedMember};
+use diagnostics::unsupported_opcode_message;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use types::{
+    JvmType, array_component_descriptor, class_descriptor, descriptor_to_class,
+    newarray_component_descriptor, parse_method_descriptor, primitive_array_opcode_matches,
+    supported_field_descriptor,
+};
 use zip::ZipArchive;
 
 pub struct CompileSpec {
@@ -1378,90 +1386,6 @@ impl Evaluator<'_> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum JvmType {
-    Int,
-    Boolean,
-    Char,
-    String,
-    Object(String),
-    Array(String),
-    Void,
-    Unsupported,
-}
-
-fn parse_method_descriptor(descriptor: &str) -> Result<(Vec<JvmType>, JvmType)> {
-    let bytes = descriptor.as_bytes();
-    if bytes.first() != Some(&b'(') {
-        bail!("invalid method descriptor `{descriptor}`");
-    }
-    let mut index = 1_usize;
-    let mut params = Vec::new();
-    while index < bytes.len() && bytes[index] != b')' {
-        params.push(parse_type(descriptor, &mut index)?);
-    }
-    if index >= bytes.len() || bytes[index] != b')' {
-        bail!("invalid method descriptor `{descriptor}`");
-    }
-    index += 1;
-    let return_type = parse_type(descriptor, &mut index)?;
-    if index != bytes.len() {
-        bail!("invalid trailing method descriptor data `{descriptor}`");
-    }
-    Ok((params, return_type))
-}
-
-fn parse_type(descriptor: &str, index: &mut usize) -> Result<JvmType> {
-    let bytes = descriptor.as_bytes();
-    if *index >= bytes.len() {
-        bail!("truncated method descriptor `{descriptor}`");
-    }
-    let ty = match bytes[*index] {
-        b'B' | b'S' | b'I' => {
-            *index += 1;
-            JvmType::Int
-        }
-        b'C' => {
-            *index += 1;
-            JvmType::Char
-        }
-        b'Z' => {
-            *index += 1;
-            JvmType::Boolean
-        }
-        b'V' => {
-            *index += 1;
-            JvmType::Void
-        }
-        b'L' => {
-            let start = *index + 1;
-            let Some(end) = descriptor[start..].find(';').map(|offset| start + offset) else {
-                bail!("unterminated object type in descriptor `{descriptor}`");
-            };
-            let class = &descriptor[start..end];
-            *index = end + 1;
-            if class == "java/lang/String" {
-                JvmType::String
-            } else {
-                JvmType::Object(class.to_string())
-            }
-        }
-        b'[' => {
-            let start = *index;
-            while *index < bytes.len() && bytes[*index] == b'[' {
-                *index += 1;
-            }
-            let _ = parse_type(descriptor, index)?;
-            JvmType::Array(descriptor[start..*index].to_string())
-        }
-        _ => {
-            *index += 1;
-            JvmType::Unsupported
-        }
-    };
-    Ok(ty)
-}
-
 fn load_local(locals: &[Option<Value>], index: usize) -> Result<Value> {
     locals
         .get(index)
@@ -1603,65 +1527,6 @@ fn default_field_value(descriptor: &str) -> Result<Value> {
         "C" => Ok(Value::Char('\0')),
         descriptor if descriptor.starts_with('L') || descriptor.starts_with('[') => Ok(Value::Null),
         other => bail!("fvm-aot unsupported field descriptor {other}"),
-    }
-}
-
-fn supported_field_descriptor(descriptor: &str) -> Result<()> {
-    match descriptor {
-        "B" | "S" | "I" | "Z" | "C" | "Ljava/lang/String;" => Ok(()),
-        descriptor if descriptor.starts_with('L') && descriptor.ends_with(';') => Ok(()),
-        descriptor if descriptor.starts_with('[') => {
-            let component = array_component_descriptor(descriptor)?;
-            supported_array_component(component)
-        }
-        other => bail!("fvm-aot unsupported field descriptor {other}"),
-    }
-}
-
-fn supported_array_component(descriptor: &str) -> Result<()> {
-    match descriptor {
-        "B" | "S" | "I" | "Z" | "C" | "Ljava/lang/String;" => Ok(()),
-        descriptor if descriptor.starts_with('L') && descriptor.ends_with(';') => Ok(()),
-        other => bail!("fvm-aot unsupported array component descriptor {other}"),
-    }
-}
-
-fn class_descriptor(class: &str) -> String {
-    format!("L{class};")
-}
-
-fn descriptor_to_class(descriptor: &str) -> Result<&str> {
-    descriptor
-        .strip_prefix('L')
-        .and_then(|value| value.strip_suffix(';'))
-        .with_context(|| format!("invalid object descriptor {descriptor}"))
-}
-
-fn array_component_descriptor(descriptor: &str) -> Result<&str> {
-    let component = descriptor
-        .strip_prefix('[')
-        .with_context(|| format!("invalid array descriptor {descriptor}"))?;
-    if component.starts_with('[') {
-        bail!("fvm-aot only supports one-dimensional arrays for now");
-    }
-    Ok(component)
-}
-
-fn newarray_component_descriptor(atype: u8) -> Result<&'static str> {
-    match atype {
-        4 => Ok("Z"),
-        5 => Ok("C"),
-        8 => Ok("B"),
-        9 => Ok("S"),
-        10 => Ok("I"),
-        other => bail!("fvm-aot unsupported newarray atype {other}"),
-    }
-}
-
-fn primitive_array_opcode_matches(expected: &str, actual: &str) -> bool {
-    match expected {
-        "B/Z" => actual == "B" || actual == "Z",
-        descriptor => actual == descriptor,
     }
 }
 
@@ -1943,95 +1808,6 @@ fn branch_target(opcode_pc: usize, offset: i16, code_len: usize) -> Result<usize
         bail!("fvm-aot branch target {target} out of range");
     }
     Ok(target as usize)
-}
-
-fn unsupported_opcode_message(opcode: u8) -> String {
-    let detail = match opcode {
-        0x09
-        | 0x0a
-        | 0x1e..=0x21
-        | 0x2f
-        | 0x37
-        | 0x3f..=0x42
-        | 0x50
-        | 0x61
-        | 0x65
-        | 0x69
-        | 0x6d
-        | 0x71
-        | 0x75
-        | 0x79
-        | 0x7b
-        | 0x7d
-        | 0x7f
-        | 0x81
-        | 0x83
-        | 0x85
-        | 0x88..=0x8a
-        | 0x94
-        | 0xad => Some(("long primitive bytecode", "primitive-completeness")),
-        0x0b..=0x0d
-        | 0x17
-        | 0x22..=0x25
-        | 0x30
-        | 0x38
-        | 0x43..=0x46
-        | 0x51
-        | 0x62
-        | 0x66
-        | 0x6a
-        | 0x6e
-        | 0x72
-        | 0x76
-        | 0x86
-        | 0x8b..=0x8d
-        | 0x95
-        | 0x96
-        | 0xae => Some(("float primitive bytecode", "primitive-completeness")),
-        0x0e
-        | 0x0f
-        | 0x18
-        | 0x26..=0x29
-        | 0x31
-        | 0x39
-        | 0x47..=0x4a
-        | 0x52
-        | 0x63
-        | 0x67
-        | 0x6b
-        | 0x6f
-        | 0x73
-        | 0x77
-        | 0x87
-        | 0x8e..=0x90
-        | 0x97
-        | 0x98
-        | 0xaf => Some(("double primitive bytecode", "primitive-completeness")),
-        0x14 => Some((
-            "long/float/double constant loading",
-            "primitive-completeness",
-        )),
-        0x5a..=0x5f => Some(("full stack manipulation opcodes", "primitive-completeness")),
-        0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82 => {
-            Some(("int bitwise and shift opcodes", "primitive-completeness"))
-        }
-        0xaa | 0xab => Some(("switch bytecodes", "primitive-completeness")),
-        0xc1 => Some(("instanceof", "primitive-completeness")),
-        0xc2 | 0xc3 => Some(("monitors/synchronization", "concurrency-profile")),
-        0xc4 => Some(("wide local-variable bytecodes", "primitive-completeness")),
-        0xc5 => Some(("multidimensional arrays", "primitive-completeness")),
-        _ => None,
-    };
-
-    if let Some((feature, milestone)) = detail {
-        format!(
-            "fvm-aot unsupported opcode 0x{opcode:02x}; required feature: {feature}; planned milestone: {milestone}"
-        )
-    } else {
-        format!(
-            "fvm-aot unsupported opcode 0x{opcode:02x}; supported subset includes int-compatible locals/arithmetic/branches, same-class objects/static helpers/fields, arrays, core String/Object intrinsics, println, and Http.respond"
-        )
-    }
 }
 
 fn emit_c(program: &AotProgram) -> String {
