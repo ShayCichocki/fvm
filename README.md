@@ -2,11 +2,14 @@
 
 ## MASSIVE WARNING
 
-FVM is experimental infrastructure software. It creates and runs Firecracker microVM artifacts, configures host TAP networking, and may require privileged Linux/KVM or privileged Docker access. Do not run untrusted artifacts, untrusted JARs, or untrusted generated binaries with this tool.
+> [!WARNING]
+> FVM is experimental infrastructure software. It creates and runs Firecracker microVM artifacts, configures host TAP networking, and may require privileged Linux/KVM or privileged Docker access. Do not run untrusted artifacts, untrusted JARs, or untrusted generated binaries with this tool.
+>
+> The `fvm-aot` backend is especially experimental. It is not full Java, not a full JVM, and not a broad GraalVM Native Image replacement yet. It currently works only for a deliberately small closed-world Java subset that fails at build time for unsupported bytecode/runtime features. The current `fvm-aot` benchmark numbers are real, but they apply to the checked example shape, not arbitrary Java applications or frameworks.
+>
+> macOS is build/test/dry-run only. Real `fvm run` and `fvm snapshot` require a Linux x86_64 host with KVM and Firecracker access.
 
-The `fvm-aot` backend is especially experimental. It is not full Java, not a full JVM, and not a broad GraalVM Native Image replacement yet. It currently works only for a deliberately small closed-world Java subset that fails at build time for unsupported bytecode/runtime features. The current `fvm-aot` benchmark numbers are real, but they apply to the checked example shape, not arbitrary Java applications or frameworks.
-
-macOS is build/test/dry-run only. Real `fvm run` and `fvm snapshot` require a Linux x86_64 host with KVM and Firecracker access.
+## Summary
 
 FVM is a Firecracker-native deployment toolchain for Java applications. It builds Java services into native microVM artifacts instead of shipping a general-purpose JVM inside a container.
 
