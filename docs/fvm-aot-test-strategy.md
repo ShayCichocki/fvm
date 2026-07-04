@@ -303,6 +303,7 @@ Required tests:
 - multi-class closed world
 - interface dispatch and string concat
 - String/Object/array core intrinsics
+- golden unsupported diagnostics for exceptions, lambdas, dynamic class loading, primitive gaps, and multidimensional arrays
 
 Current validation commands:
 

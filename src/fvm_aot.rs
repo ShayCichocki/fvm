@@ -192,6 +192,11 @@ struct Evaluator<'a> {
     depth: u8,
 }
 
+enum EvalStep {
+    Continue,
+    Return(Option<Value>),
+}
+
 impl Evaluator<'_> {
     fn eval_method(
         &mut self,
@@ -229,186 +234,216 @@ impl Evaluator<'_> {
             }
             let opcode_pc = pc;
             let opcode = read_opcode(&code.bytes, &mut pc)?;
-            match opcode {
-                0x00 => {}
-                0x01 => stack.push(Value::Null),
-                0x02 => stack.push(Value::Int(-1)),
-                0x03..=0x08 => stack.push(Value::Int((opcode - 0x03) as i32)),
-                0x10 => stack.push(Value::Int(read_code_u8(&code.bytes, &mut pc)? as i8 as i32)),
-                0x11 => stack.push(Value::Int(read_code_i16(&code.bytes, &mut pc)? as i32)),
-                0x12 => {
-                    let index = read_code_u8(&code.bytes, &mut pc)? as u16;
-                    stack.push(self.constant_value(class_file, index)?);
-                }
-                0x13 => {
-                    let index = read_code_u16(&code.bytes, &mut pc)?;
-                    stack.push(self.constant_value(class_file, index)?);
-                }
-                0x15 | 0x19 => {
-                    let index = read_code_u8(&code.bytes, &mut pc)? as usize;
-                    stack.push(load_local(&locals, index)?);
-                }
-                0x1a..=0x1d => stack.push(load_local(&locals, (opcode - 0x1a) as usize)?),
-                0x2e => self.eval_primitive_array_load(&mut stack, "I")?,
-                0x2a..=0x2d => stack.push(load_local(&locals, (opcode - 0x2a) as usize)?),
-                0x32 => self.eval_aaload(&mut stack)?,
-                0x33 => self.eval_primitive_array_load(&mut stack, "B/Z")?,
-                0x34 => self.eval_primitive_array_load(&mut stack, "C")?,
-                0x35 => self.eval_primitive_array_load(&mut stack, "S")?,
-                0x36 | 0x3a => {
-                    let index = read_code_u8(&code.bytes, &mut pc)? as usize;
-                    store_local(&mut locals, index, pop_value(&mut stack)?)?;
-                }
-                0x3b..=0x3e => {
-                    let value = pop_value(&mut stack)?;
-                    ensure_int(&value)?;
-                    store_local(&mut locals, (opcode - 0x3b) as usize, value)?;
-                }
-                0x4b..=0x4e => {
-                    let value = pop_value(&mut stack)?;
-                    store_local(&mut locals, (opcode - 0x4b) as usize, value)?;
-                }
-                0x4f => self.eval_primitive_array_store(&mut stack, "I")?,
-                0x53 => self.eval_aastore(&mut stack)?,
-                0x54 => self.eval_primitive_array_store(&mut stack, "B/Z")?,
-                0x55 => self.eval_primitive_array_store(&mut stack, "C")?,
-                0x56 => self.eval_primitive_array_store(&mut stack, "S")?,
-                0x57 => {
-                    let _ = pop_value(&mut stack)?;
-                }
-                0x59 => {
-                    let value = stack
-                        .last()
-                        .context("fvm-aot stack underflow on dup")?
-                        .clone();
-                    stack.push(value);
-                }
-                0x60 => push_binary_int(&mut stack, i32::wrapping_add)?,
-                0x64 => push_binary_int(&mut stack, i32::wrapping_sub)?,
-                0x68 => push_binary_int(&mut stack, i32::wrapping_mul)?,
-                0x6c => push_div_int(&mut stack)?,
-                0x70 => push_rem_int(&mut stack)?,
-                0x74 => {
-                    let value = pop_int(&mut stack)?;
-                    stack.push(Value::Int(value.wrapping_neg()));
-                }
-                0x84 => {
-                    let index = read_code_u8(&code.bytes, &mut pc)? as usize;
-                    let delta = read_code_u8(&code.bytes, &mut pc)? as i8 as i32;
-                    let value = local_int(&locals, index)?.wrapping_add(delta);
-                    store_local(&mut locals, index, Value::Int(value))?;
-                }
-                0x91 => {
-                    let value = pop_int(&mut stack)? as i8 as i32;
-                    stack.push(Value::Int(value));
-                }
-                0x92 => {
-                    let value = pop_int(&mut stack)? as u16 as i32;
-                    stack.push(Value::Int(value));
-                }
-                0x93 => {
-                    let value = pop_int(&mut stack)? as i16 as i32;
-                    stack.push(Value::Int(value));
-                }
-                0x99..=0x9e => {
-                    let offset = read_code_i16(&code.bytes, &mut pc)?;
-                    let value = pop_int(&mut stack)?;
-                    let take = match opcode {
-                        0x99 => value == 0,
-                        0x9a => value != 0,
-                        0x9b => value < 0,
-                        0x9c => value >= 0,
-                        0x9d => value > 0,
-                        0x9e => value <= 0,
-                        _ => unreachable!(),
-                    };
-                    if take {
-                        pc = branch_target(opcode_pc, offset, code.bytes.len())?;
+            let step = match (|| -> Result<EvalStep> {
+                match opcode {
+                    0x00 => {}
+                    0x01 => stack.push(Value::Null),
+                    0x02 => stack.push(Value::Int(-1)),
+                    0x03..=0x08 => stack.push(Value::Int((opcode - 0x03) as i32)),
+                    0x10 => {
+                        stack.push(Value::Int(read_code_u8(&code.bytes, &mut pc)? as i8 as i32))
                     }
-                }
-                0x9f..=0xa4 => {
-                    let offset = read_code_i16(&code.bytes, &mut pc)?;
-                    let rhs = pop_int(&mut stack)?;
-                    let lhs = pop_int(&mut stack)?;
-                    let take = match opcode {
-                        0x9f => lhs == rhs,
-                        0xa0 => lhs != rhs,
-                        0xa1 => lhs < rhs,
-                        0xa2 => lhs >= rhs,
-                        0xa3 => lhs > rhs,
-                        0xa4 => lhs <= rhs,
-                        _ => unreachable!(),
-                    };
-                    if take {
-                        pc = branch_target(opcode_pc, offset, code.bytes.len())?;
+                    0x11 => stack.push(Value::Int(read_code_i16(&code.bytes, &mut pc)? as i32)),
+                    0x12 => {
+                        let index = read_code_u8(&code.bytes, &mut pc)? as u16;
+                        stack.push(self.constant_value(class_file, index)?);
                     }
-                }
-                0xa5 | 0xa6 => {
-                    let offset = read_code_i16(&code.bytes, &mut pc)?;
-                    let rhs = pop_value(&mut stack)?;
-                    let lhs = pop_value(&mut stack)?;
-                    let equals = ref_equals(&lhs, &rhs);
-                    let take = if opcode == 0xa5 { equals } else { !equals };
-                    if take {
-                        pc = branch_target(opcode_pc, offset, code.bytes.len())?;
+                    0x13 => {
+                        let index = read_code_u16(&code.bytes, &mut pc)?;
+                        stack.push(self.constant_value(class_file, index)?);
                     }
-                }
-                0xa7 => {
-                    let offset = read_code_i16(&code.bytes, &mut pc)?;
-                    pc = branch_target(opcode_pc, offset, code.bytes.len())?;
-                }
-                0xac => {
-                    let result = Value::Int(pop_int(&mut stack)?);
-                    self.depth -= 1;
-                    return Ok(Some(result));
-                }
-                0xb0 => {
-                    let result = pop_value(&mut stack)?;
-                    match result {
-                        Value::String(_) | Value::Object(_) | Value::Array(_) | Value::Null => {
-                            self.depth -= 1;
-                            return Ok(Some(result));
+                    0x15 | 0x19 => {
+                        let index = read_code_u8(&code.bytes, &mut pc)? as usize;
+                        stack.push(load_local(&locals, index)?);
+                    }
+                    0x1a..=0x1d => stack.push(load_local(&locals, (opcode - 0x1a) as usize)?),
+                    0x2e => self.eval_primitive_array_load(&mut stack, "I")?,
+                    0x2a..=0x2d => stack.push(load_local(&locals, (opcode - 0x2a) as usize)?),
+                    0x32 => self.eval_aaload(&mut stack)?,
+                    0x33 => self.eval_primitive_array_load(&mut stack, "B/Z")?,
+                    0x34 => self.eval_primitive_array_load(&mut stack, "C")?,
+                    0x35 => self.eval_primitive_array_load(&mut stack, "S")?,
+                    0x36 | 0x3a => {
+                        let index = read_code_u8(&code.bytes, &mut pc)? as usize;
+                        store_local(&mut locals, index, pop_value(&mut stack)?)?;
+                    }
+                    0x3b..=0x3e => {
+                        let value = pop_value(&mut stack)?;
+                        ensure_int(&value)?;
+                        store_local(&mut locals, (opcode - 0x3b) as usize, value)?;
+                    }
+                    0x4b..=0x4e => {
+                        let value = pop_value(&mut stack)?;
+                        store_local(&mut locals, (opcode - 0x4b) as usize, value)?;
+                    }
+                    0x4f => self.eval_primitive_array_store(&mut stack, "I")?,
+                    0x53 => self.eval_aastore(&mut stack)?,
+                    0x54 => self.eval_primitive_array_store(&mut stack, "B/Z")?,
+                    0x55 => self.eval_primitive_array_store(&mut stack, "C")?,
+                    0x56 => self.eval_primitive_array_store(&mut stack, "S")?,
+                    0x57 => {
+                        let _ = pop_value(&mut stack)?;
+                    }
+                    0x59 => {
+                        let value = stack
+                            .last()
+                            .context("fvm-aot stack underflow on dup")?
+                            .clone();
+                        stack.push(value);
+                    }
+                    0x60 => push_binary_int(&mut stack, i32::wrapping_add)?,
+                    0x64 => push_binary_int(&mut stack, i32::wrapping_sub)?,
+                    0x68 => push_binary_int(&mut stack, i32::wrapping_mul)?,
+                    0x6c => push_div_int(&mut stack)?,
+                    0x70 => push_rem_int(&mut stack)?,
+                    0x74 => {
+                        let value = pop_int(&mut stack)?;
+                        stack.push(Value::Int(value.wrapping_neg()));
+                    }
+                    0x84 => {
+                        let index = read_code_u8(&code.bytes, &mut pc)? as usize;
+                        let delta = read_code_u8(&code.bytes, &mut pc)? as i8 as i32;
+                        let value = local_int(&locals, index)?.wrapping_add(delta);
+                        store_local(&mut locals, index, Value::Int(value))?;
+                    }
+                    0x91 => {
+                        let value = pop_int(&mut stack)? as i8 as i32;
+                        stack.push(Value::Int(value));
+                    }
+                    0x92 => {
+                        let value = pop_int(&mut stack)? as u16 as i32;
+                        stack.push(Value::Int(value));
+                    }
+                    0x93 => {
+                        let value = pop_int(&mut stack)? as i16 as i32;
+                        stack.push(Value::Int(value));
+                    }
+                    0x99..=0x9e => {
+                        let offset = read_code_i16(&code.bytes, &mut pc)?;
+                        let value = pop_int(&mut stack)?;
+                        let take = match opcode {
+                            0x99 => value == 0,
+                            0x9a => value != 0,
+                            0x9b => value < 0,
+                            0x9c => value >= 0,
+                            0x9d => value > 0,
+                            0x9e => value <= 0,
+                            _ => unreachable!(),
+                        };
+                        if take {
+                            pc = branch_target(opcode_pc, offset, code.bytes.len())?;
                         }
-                        other => bail!("fvm-aot areturn expected reference value, got {other:?}"),
                     }
-                }
-                0xb1 => {
-                    self.depth -= 1;
-                    return Ok(None);
-                }
-                0xbe => self.eval_arraylength(&mut stack)?,
-                0xb2 => self.eval_getstatic(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb3 => self.eval_putstatic(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb4 => self.eval_getfield(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb5 => self.eval_putfield(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb6 => self.eval_invokevirtual(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb7 => self.eval_invokespecial(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb8 => self.eval_invokestatic(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xb9 => self.eval_invokeinterface(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xba => self.eval_invokedynamic(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xbb => self.eval_new(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xbc => self.eval_newarray(&code.bytes, &mut pc, &mut stack)?,
-                0xbd => self.eval_anewarray(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xbf => bail!("fvm-aot exceptions/athrow are not supported yet"),
-                0xc0 => self.eval_checkcast(class_file, &code.bytes, &mut pc, &mut stack)?,
-                0xc6 | 0xc7 => {
-                    let offset = read_code_i16(&code.bytes, &mut pc)?;
-                    let value = pop_value(&mut stack)?;
-                    let is_null = matches!(value, Value::Null);
-                    let take = if opcode == 0xc6 { is_null } else { !is_null };
-                    if take {
+                    0x9f..=0xa4 => {
+                        let offset = read_code_i16(&code.bytes, &mut pc)?;
+                        let rhs = pop_int(&mut stack)?;
+                        let lhs = pop_int(&mut stack)?;
+                        let take = match opcode {
+                            0x9f => lhs == rhs,
+                            0xa0 => lhs != rhs,
+                            0xa1 => lhs < rhs,
+                            0xa2 => lhs >= rhs,
+                            0xa3 => lhs > rhs,
+                            0xa4 => lhs <= rhs,
+                            _ => unreachable!(),
+                        };
+                        if take {
+                            pc = branch_target(opcode_pc, offset, code.bytes.len())?;
+                        }
+                    }
+                    0xa5 | 0xa6 => {
+                        let offset = read_code_i16(&code.bytes, &mut pc)?;
+                        let rhs = pop_value(&mut stack)?;
+                        let lhs = pop_value(&mut stack)?;
+                        let equals = ref_equals(&lhs, &rhs);
+                        let take = if opcode == 0xa5 { equals } else { !equals };
+                        if take {
+                            pc = branch_target(opcode_pc, offset, code.bytes.len())?;
+                        }
+                    }
+                    0xa7 => {
+                        let offset = read_code_i16(&code.bytes, &mut pc)?;
                         pc = branch_target(opcode_pc, offset, code.bytes.len())?;
                     }
+                    0xac => {
+                        let result = Value::Int(pop_int(&mut stack)?);
+                        return Ok(EvalStep::Return(Some(result)));
+                    }
+                    0xb0 => {
+                        let result = pop_value(&mut stack)?;
+                        match result {
+                            Value::String(_) | Value::Object(_) | Value::Array(_) | Value::Null => {
+                                return Ok(EvalStep::Return(Some(result)));
+                            }
+                            other => {
+                                bail!("fvm-aot areturn expected reference value, got {other:?}")
+                            }
+                        }
+                    }
+                    0xb1 => return Ok(EvalStep::Return(None)),
+                    0xbe => self.eval_arraylength(&mut stack)?,
+                    0xb2 => self.eval_getstatic(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xb3 => self.eval_putstatic(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xb4 => self.eval_getfield(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xb5 => self.eval_putfield(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xb6 => {
+                        self.eval_invokevirtual(class_file, &code.bytes, &mut pc, &mut stack)?
+                    }
+                    0xb7 => {
+                        self.eval_invokespecial(class_file, &code.bytes, &mut pc, &mut stack)?
+                    }
+                    0xb8 => self.eval_invokestatic(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xb9 => {
+                        self.eval_invokeinterface(class_file, &code.bytes, &mut pc, &mut stack)?
+                    }
+                    0xba => {
+                        self.eval_invokedynamic(class_file, &code.bytes, &mut pc, &mut stack)?
+                    }
+                    0xbb => self.eval_new(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xbc => self.eval_newarray(&code.bytes, &mut pc, &mut stack)?,
+                    0xbd => self.eval_anewarray(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xbf => bail!("fvm-aot exceptions/athrow are not supported yet"),
+                    0xc0 => self.eval_checkcast(class_file, &code.bytes, &mut pc, &mut stack)?,
+                    0xc6 | 0xc7 => {
+                        let offset = read_code_i16(&code.bytes, &mut pc)?;
+                        let value = pop_value(&mut stack)?;
+                        let is_null = matches!(value, Value::Null);
+                        let take = if opcode == 0xc6 { is_null } else { !is_null };
+                        if take {
+                            pc = branch_target(opcode_pc, offset, code.bytes.len())?;
+                        }
+                    }
+                    other => bail!("{}", unsupported_opcode_message(other)),
                 }
-                other => bail!(
-                    "fvm-aot unsupported opcode 0x{other:02x}; supported subset includes int-compatible locals/arithmetic/branches, same-class objects/static helpers/fields, arrays, core String/Object intrinsics, println, and Http.respond"
-                ),
+                Ok(EvalStep::Continue)
+            })()
+            .with_context(|| {
+                format!(
+                    "fvm-aot bytecode error in {}.{}{} at bci {} (opcode 0x{:02x})",
+                    class_file.this_name.replace('/', "."),
+                    method.name,
+                    method.descriptor,
+                    opcode_pc,
+                    opcode
+                )
+            }) {
+                Ok(step) => step,
+                Err(err) => {
+                    self.depth -= 1;
+                    return Err(err);
+                }
+            };
+
+            if let EvalStep::Return(result) = step {
+                self.depth -= 1;
+                return Ok(result);
             }
         }
 
         self.depth -= 1;
         bail!(
-            "fvm-aot method {}{} ended without return",
+            "fvm-aot method {}.{}{} ended without return",
+            class_file.this_name.replace('/', "."),
             method.name,
             method.descriptor
         )
@@ -1019,6 +1054,11 @@ impl Evaluator<'_> {
     ) -> Result<()> {
         let method_index = read_code_u16(code, pc)?;
         let method_ref = class_file.method_ref(method_index)?;
+        if method_ref.class == "java/lang/Class" && method_ref.name == "forName" {
+            bail!(
+                "fvm-aot unsupported feature: dynamic class loading/Class.forName; required feature: closed-world reflection metadata; planned milestone: reflection-and-metadata"
+            );
+        }
         if method_ref.class == "fvm/runtime/Http"
             && method_ref.name == "respond"
             && method_ref.descriptor == "(ILjava/lang/String;)V"
@@ -1075,6 +1115,11 @@ impl Evaluator<'_> {
         let dynamic = class_file.invoke_dynamic(dynamic_index)?;
         let bootstrap = class_file.bootstrap_method(dynamic.bootstrap_method_attr_index)?;
         let bootstrap_method = class_file.method_handle_ref(bootstrap.method_ref)?;
+        if bootstrap_method.class == "java/lang/invoke/LambdaMetafactory" {
+            bail!(
+                "fvm-aot unsupported invokedynamic LambdaMetafactory; required feature: lambdas/method references; planned milestone: dispatch-and-lambdas"
+            );
+        }
         if bootstrap_method.class != "java/lang/invoke/StringConcatFactory" {
             bail!(
                 "fvm-aot only supports StringConcatFactory invokedynamic for now, got {}.{}{}",
@@ -1898,6 +1943,95 @@ fn branch_target(opcode_pc: usize, offset: i16, code_len: usize) -> Result<usize
     Ok(target as usize)
 }
 
+fn unsupported_opcode_message(opcode: u8) -> String {
+    let detail = match opcode {
+        0x09
+        | 0x0a
+        | 0x1e..=0x21
+        | 0x2f
+        | 0x37
+        | 0x3f..=0x42
+        | 0x50
+        | 0x61
+        | 0x65
+        | 0x69
+        | 0x6d
+        | 0x71
+        | 0x75
+        | 0x79
+        | 0x7b
+        | 0x7d
+        | 0x7f
+        | 0x81
+        | 0x83
+        | 0x85
+        | 0x88..=0x8a
+        | 0x94
+        | 0xad => Some(("long primitive bytecode", "primitive-completeness")),
+        0x0b..=0x0d
+        | 0x17
+        | 0x22..=0x25
+        | 0x30
+        | 0x38
+        | 0x43..=0x46
+        | 0x51
+        | 0x62
+        | 0x66
+        | 0x6a
+        | 0x6e
+        | 0x72
+        | 0x76
+        | 0x86
+        | 0x8b..=0x8d
+        | 0x95
+        | 0x96
+        | 0xae => Some(("float primitive bytecode", "primitive-completeness")),
+        0x0e
+        | 0x0f
+        | 0x18
+        | 0x26..=0x29
+        | 0x31
+        | 0x39
+        | 0x47..=0x4a
+        | 0x52
+        | 0x63
+        | 0x67
+        | 0x6b
+        | 0x6f
+        | 0x73
+        | 0x77
+        | 0x87
+        | 0x8e..=0x90
+        | 0x97
+        | 0x98
+        | 0xaf => Some(("double primitive bytecode", "primitive-completeness")),
+        0x14 => Some((
+            "long/float/double constant loading",
+            "primitive-completeness",
+        )),
+        0x5a..=0x5f => Some(("full stack manipulation opcodes", "primitive-completeness")),
+        0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82 => {
+            Some(("int bitwise and shift opcodes", "primitive-completeness"))
+        }
+        0xaa | 0xab => Some(("switch bytecodes", "primitive-completeness")),
+        0xc1 => Some(("instanceof", "primitive-completeness")),
+        0xc2 | 0xc3 => Some(("monitors/synchronization", "concurrency-profile")),
+        0xc4 => Some(("wide local-variable bytecodes", "primitive-completeness")),
+        0xc5 => Some(("multidimensional arrays", "primitive-completeness")),
+        _ => None,
+    };
+
+    if let Some((feature, milestone)) = detail {
+        format!(
+            "fvm-aot unsupported opcode 0x{opcode:02x}; required feature: {feature}; planned milestone: {milestone}"
+        )
+    } else {
+        format!(
+            "fvm-aot unsupported opcode 0x{opcode:02x}; supported subset includes int-compatible locals/arithmetic/branches, same-class objects/static helpers/fields, arrays, core String/Object intrinsics, println, and Http.respond"
+        )
+    }
+}
+
 fn emit_c(program: &AotProgram) -> String {
     if let Some(server) = &program.http_server {
         return emit_http_server_c(server);
@@ -2605,6 +2739,120 @@ mod tests {
     fn rejects_invalid_classfile() {
         let err = ClassFile::parse(b"nope").unwrap_err();
         assert!(err.to_string().contains("truncated") || err.to_string().contains("magic"));
+    }
+
+    #[test]
+    fn unsupported_athrow_reports_class_method_and_bci() {
+        assert_unsupported_source(
+            "AotUnsupportedThrow",
+            r#"public final class AotUnsupportedThrow {
+    public static void main(String[] args) {
+        throw null;
+    }
+}
+"#,
+            &[
+                "fvm-aot bytecode error in AotUnsupportedThrow.main([Ljava/lang/String;)V at bci",
+                "opcode 0xbf",
+                "fvm-aot exceptions/athrow are not supported yet",
+            ],
+        );
+    }
+
+    #[test]
+    fn unsupported_lambda_reports_required_feature() {
+        assert_unsupported_source(
+            "AotUnsupportedLambda",
+            r#"public final class AotUnsupportedLambda {
+    public static void main(String[] args) {
+        Runnable runnable = () -> System.out.println("lambda");
+        runnable.run();
+    }
+}
+"#,
+            &[
+                "fvm-aot bytecode error in AotUnsupportedLambda.main([Ljava/lang/String;)V at bci",
+                "opcode 0xba",
+                "LambdaMetafactory",
+                "required feature: lambdas/method references",
+                "planned milestone: dispatch-and-lambdas",
+            ],
+        );
+    }
+
+    #[test]
+    fn unsupported_dynamic_class_loading_reports_required_feature() {
+        assert_unsupported_source(
+            "AotUnsupportedClassForName",
+            r#"public final class AotUnsupportedClassForName {
+    public static void main(String[] args) throws Exception {
+        Class.forName("example.Missing");
+    }
+}
+"#,
+            &[
+                "fvm-aot bytecode error in AotUnsupportedClassForName.main([Ljava/lang/String;)V at bci",
+                "opcode 0xb8",
+                "dynamic class loading/Class.forName",
+                "required feature: closed-world reflection metadata",
+                "planned milestone: reflection-and-metadata",
+            ],
+        );
+    }
+
+    #[test]
+    fn unsupported_long_and_double_report_primitive_gap() {
+        assert_unsupported_source(
+            "AotUnsupportedLong",
+            r#"public final class AotUnsupportedLong {
+    public static void main(String[] args) {
+        long value = 1L;
+        System.out.println(value);
+    }
+}
+"#,
+            &[
+                "fvm-aot bytecode error in AotUnsupportedLong.main([Ljava/lang/String;)V at bci",
+                "required feature: long primitive bytecode",
+                "planned milestone: primitive-completeness",
+            ],
+        );
+
+        assert_unsupported_source(
+            "AotUnsupportedDouble",
+            r#"public final class AotUnsupportedDouble {
+    public static void main(String[] args) {
+        double value = 1.0d;
+        System.out.println(value);
+    }
+}
+"#,
+            &[
+                "fvm-aot bytecode error in AotUnsupportedDouble.main([Ljava/lang/String;)V at bci",
+                "required feature: double primitive bytecode",
+                "planned milestone: primitive-completeness",
+            ],
+        );
+    }
+
+    #[test]
+    fn unsupported_multidimensional_array_reports_required_feature() {
+        assert_unsupported_source(
+            "AotUnsupportedMultiArray",
+            r#"public final class AotUnsupportedMultiArray {
+    public static void main(String[] args) {
+        int[][] values = new int[1][1];
+        System.out.println(values.length);
+    }
+}
+"#,
+            &[
+                "fvm-aot bytecode error in AotUnsupportedMultiArray.main([Ljava/lang/String;)V at bci",
+                "opcode 0xc5",
+                "required feature: multidimensional arrays",
+                "planned milestone: primitive-completeness",
+            ],
+        );
     }
 
     #[test]
@@ -3361,6 +3609,63 @@ public final class Http {
             "AotHello",
             &[("AotHello.class", class_file.to_path_buf())],
         );
+    }
+
+    fn assert_unsupported_source(main_class: &str, source: &str, expected: &[&str]) {
+        if !command_available("javac") {
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let Some(jar) = compile_single_source_jar(temp.path(), main_class, source) else {
+            return;
+        };
+        let err = compile_jar(&CompileSpec {
+            jar_path: jar,
+            main_class: Some(main_class.to_string()),
+            output_path: temp.path().join("unsupported-native"),
+            cc: "cc".to_string(),
+            dry_run: true,
+        })
+        .unwrap_err();
+        let text = format!("{err:#}");
+
+        for expected in expected {
+            assert!(
+                text.contains(expected),
+                "error did not contain `{expected}`:\n{text}"
+            );
+        }
+    }
+
+    fn compile_single_source_jar(temp: &Path, main_class: &str, source: &str) -> Option<PathBuf> {
+        let src_dir = temp.join("src");
+        let classes_dir = temp.join("classes");
+        std::fs::create_dir_all(&src_dir).ok()?;
+        std::fs::create_dir_all(&classes_dir).ok()?;
+        let src = src_dir.join(format!("{main_class}.java"));
+        std::fs::write(&src, source).ok()?;
+
+        let javac = Command::new("javac")
+            .arg("--release")
+            .arg("17")
+            .arg("-d")
+            .arg(&classes_dir)
+            .arg(&src)
+            .status()
+            .ok()?;
+        if !javac.success() {
+            return None;
+        }
+
+        let jar = temp.join(format!("{main_class}.jar"));
+        let class_entry = format!("{main_class}.class");
+        write_test_jar_entries(
+            &jar,
+            main_class,
+            &[(&class_entry, classes_dir.join(&class_entry))],
+        );
+        Some(jar)
     }
 
     fn write_test_jar_entries(path: &Path, main_class: &str, entries: &[(&str, PathBuf)]) {

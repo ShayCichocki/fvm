@@ -280,3 +280,5 @@ fvm-aot unsupported opcode invokedynamic LambdaMetafactory in com/example/App.ha
 required feature: lambdas/method references
 planned milestone: dispatch-and-lambdas
 ```
+
+Current AOT-0 golden diagnostics cover exceptions/`athrow`, `LambdaMetafactory` lambdas, `Class.forName` dynamic class loading, `long`/`double` primitive bytecode gaps, and multidimensional arrays.
