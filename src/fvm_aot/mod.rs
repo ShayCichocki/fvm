@@ -3,6 +3,8 @@ mod classfile;
 mod diagnostics;
 mod emitter;
 mod evaluator;
+#[cfg(test)]
+mod test_support;
 mod types;
 use classfile::ClassFile;
 use emitter::emit_c;
@@ -121,9 +123,10 @@ fn make_executable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::{Duration, Instant};
+    use crate::fvm_aot::test_support::{
+        AotFixture, ClassEntry, HTTP_RUNTIME_SOURCE, JarSpec, JavaSource, NativeSpec,
+        command_available, run_hotspot, run_native, run_native_http,
+    };
 
     #[test]
     fn rejects_invalid_classfile() {
@@ -251,48 +254,45 @@ mod tests {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let src = src_dir.join("AotHello.java");
-        std::fs::write(
-            &src,
-            r#"public final class AotHello {
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[JavaSource {
+                relative_path: "AotHello.java",
+                contents: r#"public final class AotHello {
     public static void main(String[] args) {
         System.out.println("hello fvm-aot");
     }
 }
 "#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&src)
-            .status()
+            }])
             .unwrap();
-        if !javac.success() {
-            return;
+        if command_available("java") {
+            let hotspot = run_hotspot(&classes, "AotHello").unwrap();
+            assert!(hotspot.status.success());
+            assert_eq!(String::from_utf8_lossy(&hotspot.stdout), "hello fvm-aot\n");
         }
-
-        let jar = temp.path().join("hello.jar");
-        write_test_jar(&jar, &classes_dir.join("AotHello.class"));
-        let output = temp.path().join("hello-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotHello".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let run = Command::new(output).output().unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "hello.jar",
+                    main_class: "AotHello",
+                    entries: &[ClassEntry {
+                        jar_entry: "AotHello.class",
+                        class_relative_path: "AotHello.class",
+                    }],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotHello",
+                output_name: "hello-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let run = run_native(&output).unwrap();
         assert!(run.status.success());
         assert_eq!(String::from_utf8_lossy(&run.stdout), "hello fvm-aot\n");
     }
@@ -303,17 +303,12 @@ mod tests {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let runtime_dir = src_dir.join("fvm/runtime");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let src = src_dir.join("AotHttpEval.java");
-        let http = runtime_dir.join("Http.java");
-        std::fs::write(
-            &src,
-            r#"import fvm.runtime.Http;
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[
+                JavaSource {
+                    relative_path: "AotHttpEval.java",
+                    contents: r#"import fvm.runtime.Http;
 
 public final class AotHttpEval {
     static int port() {
@@ -334,60 +329,41 @@ public final class AotHttpEval {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &http,
-            r#"package fvm.runtime;
-
-public final class Http {
-    private Http() {}
-    public static void respond(int port, String body) {}
-}
-"#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&src)
-            .arg(&http)
-            .status()
+                },
+                JavaSource {
+                    relative_path: "fvm/runtime/Http.java",
+                    contents: HTTP_RUNTIME_SOURCE,
+                },
+            ])
             .unwrap();
-        if !javac.success() {
-            return;
-        }
-
-        let jar = temp.path().join("http.jar");
-        write_test_jar_entries(
-            &jar,
-            "AotHttpEval",
-            &[
-                ("AotHttpEval.class", classes_dir.join("AotHttpEval.class")),
-                (
-                    "fvm/runtime/Http.class",
-                    classes_dir.join("fvm/runtime/Http.class"),
-                ),
-            ],
-        );
-        let output = temp.path().join("http-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotHttpEval".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let mut child = Command::new(&output).spawn().unwrap();
-        let response = wait_http_response(19091);
-        let _ = child.kill();
-        let _ = child.wait();
-        let response = response.unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "http.jar",
+                    main_class: "AotHttpEval",
+                    entries: &[
+                        ClassEntry {
+                            jar_entry: "AotHttpEval.class",
+                            class_relative_path: "AotHttpEval.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "fvm/runtime/Http.class",
+                            class_relative_path: "fvm/runtime/Http.class",
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotHttpEval",
+                output_name: "http-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let response = run_native_http(&output, 19091).unwrap();
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("computed fvm-aot http"));
     }
@@ -398,17 +374,12 @@ public final class Http {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let runtime_dir = src_dir.join("fvm/runtime");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let src = src_dir.join("AotStatic.java");
-        let http = runtime_dir.join("Http.java");
-        std::fs::write(
-            &src,
-            r#"import fvm.runtime.Http;
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[
+                JavaSource {
+                    relative_path: "AotStatic.java",
+                    contents: r#"import fvm.runtime.Http;
 
 public final class AotStatic {
     static int base = 19000;
@@ -429,60 +400,41 @@ public final class AotStatic {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &http,
-            r#"package fvm.runtime;
-
-public final class Http {
-    private Http() {}
-    public static void respond(int port, String body) {}
-}
-"#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&src)
-            .arg(&http)
-            .status()
+                },
+                JavaSource {
+                    relative_path: "fvm/runtime/Http.java",
+                    contents: HTTP_RUNTIME_SOURCE,
+                },
+            ])
             .unwrap();
-        if !javac.success() {
-            return;
-        }
-
-        let jar = temp.path().join("static.jar");
-        write_test_jar_entries(
-            &jar,
-            "AotStatic",
-            &[
-                ("AotStatic.class", classes_dir.join("AotStatic.class")),
-                (
-                    "fvm/runtime/Http.class",
-                    classes_dir.join("fvm/runtime/Http.class"),
-                ),
-            ],
-        );
-        let output = temp.path().join("static-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotStatic".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let mut child = Command::new(&output).spawn().unwrap();
-        let response = wait_http_response(19092);
-        let _ = child.kill();
-        let _ = child.wait();
-        let response = response.unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "static.jar",
+                    main_class: "AotStatic",
+                    entries: &[
+                        ClassEntry {
+                            jar_entry: "AotStatic.class",
+                            class_relative_path: "AotStatic.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "fvm/runtime/Http.class",
+                            class_relative_path: "fvm/runtime/Http.class",
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotStatic",
+                output_name: "static-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let response = run_native_http(&output, 19092).unwrap();
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("static fvm-aot http"));
     }
@@ -493,17 +445,12 @@ public final class Http {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let runtime_dir = src_dir.join("fvm/runtime");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let src = src_dir.join("AotObjects.java");
-        let http = runtime_dir.join("Http.java");
-        std::fs::write(
-            &src,
-            r#"import fvm.runtime.Http;
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[
+                JavaSource {
+                    relative_path: "AotObjects.java",
+                    contents: r#"import fvm.runtime.Http;
 
 public final class AotObjects {
     int base;
@@ -530,60 +477,41 @@ public final class AotObjects {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &http,
-            r#"package fvm.runtime;
-
-public final class Http {
-    private Http() {}
-    public static void respond(int port, String body) {}
-}
-"#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&src)
-            .arg(&http)
-            .status()
+                },
+                JavaSource {
+                    relative_path: "fvm/runtime/Http.java",
+                    contents: HTTP_RUNTIME_SOURCE,
+                },
+            ])
             .unwrap();
-        if !javac.success() {
-            return;
-        }
-
-        let jar = temp.path().join("objects.jar");
-        write_test_jar_entries(
-            &jar,
-            "AotObjects",
-            &[
-                ("AotObjects.class", classes_dir.join("AotObjects.class")),
-                (
-                    "fvm/runtime/Http.class",
-                    classes_dir.join("fvm/runtime/Http.class"),
-                ),
-            ],
-        );
-        let output = temp.path().join("objects-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotObjects".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let mut child = Command::new(&output).spawn().unwrap();
-        let response = wait_http_response(19090);
-        let _ = child.kill();
-        let _ = child.wait();
-        let response = response.unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "objects.jar",
+                    main_class: "AotObjects",
+                    entries: &[
+                        ClassEntry {
+                            jar_entry: "AotObjects.class",
+                            class_relative_path: "AotObjects.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "fvm/runtime/Http.class",
+                            class_relative_path: "fvm/runtime/Http.class",
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotObjects",
+                output_name: "objects-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let response = run_native_http(&output, 19090).unwrap();
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("object array fvm-aot http"));
     }
@@ -594,19 +522,12 @@ public final class Http {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let runtime_dir = src_dir.join("fvm/runtime");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let app = src_dir.join("AotMulti.java");
-        let config = src_dir.join("AotConfig.java");
-        let handler = src_dir.join("AotHandler.java");
-        let http = runtime_dir.join("Http.java");
-        std::fs::write(
-            &app,
-            r#"import fvm.runtime.Http;
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[
+                JavaSource {
+                    relative_path: "AotMulti.java",
+                    contents: r#"import fvm.runtime.Http;
 
 public final class AotMulti {
     public static void main(String[] args) {
@@ -616,11 +537,10 @@ public final class AotMulti {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &config,
-            r#"public final class AotConfig {
+                },
+                JavaSource {
+                    relative_path: "AotConfig.java",
+                    contents: r#"public final class AotConfig {
     int base;
     int[] offsets;
     String body;
@@ -636,11 +556,10 @@ public final class AotMulti {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &handler,
-            r#"public final class AotHandler {
+                },
+                JavaSource {
+                    relative_path: "AotHandler.java",
+                    contents: r#"public final class AotHandler {
     AotConfig config;
     String[] bodies;
 
@@ -658,64 +577,49 @@ public final class AotMulti {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &http,
-            r#"package fvm.runtime;
-
-public final class Http {
-    private Http() {}
-    public static void respond(int port, String body) {}
-}
-"#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&app)
-            .arg(&config)
-            .arg(&handler)
-            .arg(&http)
-            .status()
+                },
+                JavaSource {
+                    relative_path: "fvm/runtime/Http.java",
+                    contents: HTTP_RUNTIME_SOURCE,
+                },
+            ])
             .unwrap();
-        if !javac.success() {
-            return;
-        }
-
-        let jar = temp.path().join("multi.jar");
-        write_test_jar_entries(
-            &jar,
-            "AotMulti",
-            &[
-                ("AotMulti.class", classes_dir.join("AotMulti.class")),
-                ("AotConfig.class", classes_dir.join("AotConfig.class")),
-                ("AotHandler.class", classes_dir.join("AotHandler.class")),
-                (
-                    "fvm/runtime/Http.class",
-                    classes_dir.join("fvm/runtime/Http.class"),
-                ),
-            ],
-        );
-        let output = temp.path().join("multi-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotMulti".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let mut child = Command::new(&output).spawn().unwrap();
-        let response = wait_http_response(19093);
-        let _ = child.kill();
-        let _ = child.wait();
-        let response = response.unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "multi.jar",
+                    main_class: "AotMulti",
+                    entries: &[
+                        ClassEntry {
+                            jar_entry: "AotMulti.class",
+                            class_relative_path: "AotMulti.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "AotConfig.class",
+                            class_relative_path: "AotConfig.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "AotHandler.class",
+                            class_relative_path: "AotHandler.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "fvm/runtime/Http.class",
+                            class_relative_path: "fvm/runtime/Http.class",
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotMulti",
+                output_name: "multi-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let response = run_native_http(&output, 19093).unwrap();
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("multi class fvm-aot http"));
     }
@@ -726,20 +630,12 @@ public final class Http {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let runtime_dir = src_dir.join("fvm/runtime");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let app = src_dir.join("AotDispatch.java");
-        let responder = src_dir.join("AotResponder.java");
-        let config = src_dir.join("AotDispatchConfig.java");
-        let handler = src_dir.join("AotDispatchHandler.java");
-        let http = runtime_dir.join("Http.java");
-        std::fs::write(
-            &app,
-            r#"import fvm.runtime.Http;
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[
+                JavaSource {
+                    relative_path: "AotDispatch.java",
+                    contents: r#"import fvm.runtime.Http;
 
 public final class AotDispatch {
     public static void main(String[] args) {
@@ -748,20 +644,18 @@ public final class AotDispatch {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &responder,
-            r#"public interface AotResponder {
+                },
+                JavaSource {
+                    relative_path: "AotResponder.java",
+                    contents: r#"public interface AotResponder {
     int port();
     String body();
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &config,
-            r#"public final class AotDispatchConfig {
+                },
+                JavaSource {
+                    relative_path: "AotDispatchConfig.java",
+                    contents: r#"public final class AotDispatchConfig {
     int base;
     int offset;
     String name;
@@ -777,11 +671,10 @@ public final class AotDispatch {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &handler,
-            r#"public final class AotDispatchHandler implements AotResponder {
+                },
+                JavaSource {
+                    relative_path: "AotDispatchHandler.java",
+                    contents: r#"public final class AotDispatchHandler implements AotResponder {
     AotDispatchConfig config;
 
     AotDispatchHandler(AotDispatchConfig config) {
@@ -797,72 +690,53 @@ public final class AotDispatch {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &http,
-            r#"package fvm.runtime;
-
-public final class Http {
-    private Http() {}
-    public static void respond(int port, String body) {}
-}
-"#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&app)
-            .arg(&responder)
-            .arg(&config)
-            .arg(&handler)
-            .arg(&http)
-            .status()
+                },
+                JavaSource {
+                    relative_path: "fvm/runtime/Http.java",
+                    contents: HTTP_RUNTIME_SOURCE,
+                },
+            ])
             .unwrap();
-        if !javac.success() {
-            return;
-        }
-
-        let jar = temp.path().join("dispatch.jar");
-        write_test_jar_entries(
-            &jar,
-            "AotDispatch",
-            &[
-                ("AotDispatch.class", classes_dir.join("AotDispatch.class")),
-                ("AotResponder.class", classes_dir.join("AotResponder.class")),
-                (
-                    "AotDispatchConfig.class",
-                    classes_dir.join("AotDispatchConfig.class"),
-                ),
-                (
-                    "AotDispatchHandler.class",
-                    classes_dir.join("AotDispatchHandler.class"),
-                ),
-                (
-                    "fvm/runtime/Http.class",
-                    classes_dir.join("fvm/runtime/Http.class"),
-                ),
-            ],
-        );
-        let output = temp.path().join("dispatch-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotDispatch".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let mut child = Command::new(&output).spawn().unwrap();
-        let response = wait_http_response(19094);
-        let _ = child.kill();
-        let _ = child.wait();
-        let response = response.unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "dispatch.jar",
+                    main_class: "AotDispatch",
+                    entries: &[
+                        ClassEntry {
+                            jar_entry: "AotDispatch.class",
+                            class_relative_path: "AotDispatch.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "AotResponder.class",
+                            class_relative_path: "AotResponder.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "AotDispatchConfig.class",
+                            class_relative_path: "AotDispatchConfig.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "AotDispatchHandler.class",
+                            class_relative_path: "AotDispatchHandler.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "fvm/runtime/Http.class",
+                            class_relative_path: "fvm/runtime/Http.class",
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotDispatch",
+                output_name: "dispatch-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let response = run_native_http(&output, 19094).unwrap();
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("dispatch fvm #19094"));
     }
@@ -873,17 +747,12 @@ public final class Http {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let src_dir = temp.path().join("src");
-        let runtime_dir = src_dir.join("fvm/runtime");
-        let classes_dir = temp.path().join("classes");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::create_dir_all(&classes_dir).unwrap();
-        let app = src_dir.join("AotCoreMethods.java");
-        let http = runtime_dir.join("Http.java");
-        std::fs::write(
-            &app,
-            r#"import fvm.runtime.Http;
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[
+                JavaSource {
+                    relative_path: "AotCoreMethods.java",
+                    contents: r#"import fvm.runtime.Http;
 
 public final class AotCoreMethods {
     static boolean enabled = true;
@@ -928,77 +797,43 @@ public final class AotCoreMethods {
     }
 }
 "#,
-        )
-        .unwrap();
-        std::fs::write(
-            &http,
-            r#"package fvm.runtime;
-
-public final class Http {
-    private Http() {}
-    public static void respond(int port, String body) {}
-}
-"#,
-        )
-        .unwrap();
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&app)
-            .arg(&http)
-            .status()
+                },
+                JavaSource {
+                    relative_path: "fvm/runtime/Http.java",
+                    contents: HTTP_RUNTIME_SOURCE,
+                },
+            ])
             .unwrap();
-        if !javac.success() {
-            return;
-        }
-
-        let jar = temp.path().join("core-methods.jar");
-        write_test_jar_entries(
-            &jar,
-            "AotCoreMethods",
-            &[
-                (
-                    "AotCoreMethods.class",
-                    classes_dir.join("AotCoreMethods.class"),
-                ),
-                (
-                    "fvm/runtime/Http.class",
-                    classes_dir.join("fvm/runtime/Http.class"),
-                ),
-            ],
-        );
-        let output = temp.path().join("core-methods-native");
-        compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some("AotCoreMethods".to_string()),
-            output_path: output.clone(),
-            cc: "cc".to_string(),
-            dry_run: false,
-        })
-        .unwrap();
-
-        let mut child = Command::new(&output).spawn().unwrap();
-        let response = wait_http_response(19095);
-        let _ = child.kill();
-        let _ = child.wait();
-        let response = response.unwrap();
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: "core-methods.jar",
+                    main_class: "AotCoreMethods",
+                    entries: &[
+                        ClassEntry {
+                            jar_entry: "AotCoreMethods.class",
+                            class_relative_path: "AotCoreMethods.class",
+                        },
+                        ClassEntry {
+                            jar_entry: "fvm/runtime/Http.class",
+                            class_relative_path: "fvm/runtime/Http.class",
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let output = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class: "AotCoreMethods",
+                output_name: "core-methods-native",
+                dry_run: false,
+            })
+            .unwrap();
+        let response = run_native_http(&output, 19095).unwrap();
         assert!(response.contains("HTTP/1.1 200 OK"));
         assert!(response.ends_with("fvm-core core true true true !"));
-    }
-
-    fn command_available(name: &str) -> bool {
-        Command::new(name).arg("--version").output().is_ok()
-    }
-
-    fn write_test_jar(path: &Path, class_file: &Path) {
-        write_test_jar_entries(
-            path,
-            "AotHello",
-            &[("AotHello.class", class_file.to_path_buf())],
-        );
     }
 
     fn assert_unsupported_source(main_class: &str, source: &str, expected: &[&str]) {
@@ -1006,18 +841,35 @@ public final class Http {
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let Some(jar) = compile_single_source_jar(temp.path(), main_class, source) else {
-            return;
-        };
-        let err = compile_jar(&CompileSpec {
-            jar_path: jar,
-            main_class: Some(main_class.to_string()),
-            output_path: temp.path().join("unsupported-native"),
-            cc: "cc".to_string(),
-            dry_run: true,
-        })
-        .unwrap_err();
+        let fixture = AotFixture::new().unwrap();
+        let classes = fixture
+            .compile_sources(&[JavaSource {
+                relative_path: &format!("{main_class}.java"),
+                contents: source,
+            }])
+            .unwrap();
+        let class_entry = format!("{main_class}.class");
+        let jar = fixture
+            .package_jar(
+                &classes,
+                JarSpec {
+                    jar_name: &format!("{main_class}.jar"),
+                    main_class,
+                    entries: &[ClassEntry {
+                        jar_entry: &class_entry,
+                        class_relative_path: &class_entry,
+                    }],
+                },
+            )
+            .unwrap();
+        let err = fixture
+            .compile_native(NativeSpec {
+                jar_path: jar,
+                main_class,
+                output_name: "unsupported-native",
+                dry_run: true,
+            })
+            .unwrap_err();
         let text = format!("{err:#}");
 
         for expected in expected {
@@ -1026,63 +878,5 @@ public final class Http {
                 "error did not contain `{expected}`:\n{text}"
             );
         }
-    }
-
-    fn compile_single_source_jar(temp: &Path, main_class: &str, source: &str) -> Option<PathBuf> {
-        let src_dir = temp.join("src");
-        let classes_dir = temp.join("classes");
-        std::fs::create_dir_all(&src_dir).ok()?;
-        std::fs::create_dir_all(&classes_dir).ok()?;
-        let src = src_dir.join(format!("{main_class}.java"));
-        std::fs::write(&src, source).ok()?;
-
-        let javac = Command::new("javac")
-            .arg("--release")
-            .arg("17")
-            .arg("-d")
-            .arg(&classes_dir)
-            .arg(&src)
-            .status()
-            .ok()?;
-        if !javac.success() {
-            return None;
-        }
-
-        let jar = temp.join(format!("{main_class}.jar"));
-        let class_entry = format!("{main_class}.class");
-        write_test_jar_entries(
-            &jar,
-            main_class,
-            &[(&class_entry, classes_dir.join(&class_entry))],
-        );
-        Some(jar)
-    }
-
-    fn write_test_jar_entries(path: &Path, main_class: &str, entries: &[(&str, PathBuf)]) {
-        let file = std::fs::File::create(path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::FileOptions::<()>::default();
-        zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
-        zip.write_all(format!("Manifest-Version: 1.0\nMain-Class: {main_class}\n").as_bytes())
-            .unwrap();
-        for (name, path) in entries {
-            zip.start_file(*name, options).unwrap();
-            zip.write_all(&std::fs::read(path).unwrap()).unwrap();
-        }
-        zip.finish().unwrap();
-    }
-
-    fn wait_http_response(port: u16) -> Result<String> {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
-                stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
-                let mut response = String::new();
-                stream.read_to_string(&mut response)?;
-                return Ok(response);
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        bail!("timed out waiting for generated HTTP server on {port}")
     }
 }
