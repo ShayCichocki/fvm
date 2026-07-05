@@ -6,6 +6,7 @@ mod evaluator;
 mod ir;
 #[cfg(test)]
 mod lower;
+mod reachability;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -132,6 +133,7 @@ mod tests {
     mod failure_artifacts;
     mod ir;
     mod lower;
+    mod reachability;
     mod unsupported;
 
     #[test]
