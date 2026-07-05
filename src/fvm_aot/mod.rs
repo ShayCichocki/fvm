@@ -125,6 +125,7 @@ mod tests {
     use super::*;
 
     mod current_slice;
+    mod differential;
     mod unsupported;
 
     #[test]
