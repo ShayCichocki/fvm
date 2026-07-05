@@ -126,6 +126,7 @@ mod tests {
 
     mod current_slice;
     mod differential;
+    mod failure_artifacts;
     mod unsupported;
 
     #[test]

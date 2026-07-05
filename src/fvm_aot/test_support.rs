@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+const KEEP_FAILED_AOT_ENV: &str = "FVM_KEEP_FAILED_AOT";
+
 pub(super) const HTTP_RUNTIME_SOURCE: &str = r#"package fvm.runtime;
 
 public final class Http {
@@ -49,6 +51,17 @@ impl CompiledSources {
 
 pub(super) struct AotFixture {
     temp: Option<tempfile::TempDir>,
+}
+
+#[derive(Debug)]
+pub(super) struct FailedAotArtifacts {
+    retained_dir: Option<PathBuf>,
+}
+
+impl FailedAotArtifacts {
+    pub(super) fn retained_dir(&self) -> Option<&Path> {
+        self.retained_dir.as_deref()
+    }
 }
 
 impl AotFixture {
@@ -141,6 +154,25 @@ impl AotFixture {
         Ok(output_path)
     }
 
+    pub(super) fn preserve_failed_artifacts(&mut self, reason: &str) -> FailedAotArtifacts {
+        if keep_failed_aot_artifacts() {
+            let retained_dir = self.keep_artifacts();
+            eprintln!(
+                "preserved AOT test artifacts at {} ({reason})",
+                retained_dir.display()
+            );
+            return FailedAotArtifacts {
+                retained_dir: Some(retained_dir),
+            };
+        }
+
+        FailedAotArtifacts { retained_dir: None }
+    }
+
+    pub(super) fn artifact_path(&self, relative_path: &str) -> PathBuf {
+        self.path().join(relative_path)
+    }
+
     pub(super) fn keep_artifacts(&mut self) -> PathBuf {
         let temp = self.temp.take().expect("AOT test tempdir already consumed");
         temp.keep()
@@ -157,12 +189,17 @@ impl AotFixture {
 impl Drop for AotFixture {
     fn drop(&mut self) {
         if std::thread::panicking()
+            && keep_failed_aot_artifacts()
             && let Some(temp) = self.temp.take()
         {
             let path = temp.keep();
             eprintln!("preserved AOT test artifacts at {}", path.display());
         }
     }
+}
+
+fn keep_failed_aot_artifacts() -> bool {
+    std::env::var_os(KEEP_FAILED_AOT_ENV).is_some_and(|value| value == "1")
 }
 
 pub(super) fn command_available(name: &str) -> bool {
