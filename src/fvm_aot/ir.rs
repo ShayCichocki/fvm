@@ -3,7 +3,8 @@
 // allow: SIZE_OK - single runtime compiler IR model; T17 owns verifier extraction.
 
 use anyhow::{Result, bail};
-use std::fmt;
+
+mod display;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FunctionIr {
@@ -33,6 +34,7 @@ impl FunctionIr {
                     }
                     IrInstr::Param(..)
                     | IrInstr::Constant(..)
+                    | IrInstr::Compare(..)
                     | IrInstr::Arithmetic(..)
                     | IrInstr::Unary(..)
                     | IrInstr::Call(..)
@@ -71,30 +73,6 @@ impl FunctionIr {
     }
 }
 
-impl fmt::Display for FunctionIr {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(output, "fn {}", self.name)?;
-        if !self.params.is_empty() {
-            write!(output, "(")?;
-            for (index, param) in self.params.iter().enumerate() {
-                if index > 0 {
-                    write!(output, ", ")?;
-                }
-                write!(output, "{}: {}", param.value, param.ty)?;
-            }
-            write!(output, ")")?;
-        }
-        writeln!(output, " -> {} {{", self.return_type)?;
-        for block in &self.blocks {
-            writeln!(output, "{}:", block.id)?;
-            for instr in &block.instrs {
-                writeln!(output, "  {instr}")?;
-            }
-        }
-        writeln!(output, "}}")
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct IrParam {
     pub(super) value: ValueId,
@@ -116,24 +94,12 @@ impl BasicBlockId {
     }
 }
 
-impl fmt::Display for BasicBlockId {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(output, "bb{}", self.0)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct ValueId(u32);
 
 impl ValueId {
     pub(super) const fn new(raw: u32) -> Self {
         Self(raw)
-    }
-}
-
-impl fmt::Display for ValueId {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(output, "v{}", self.0)
     }
 }
 
@@ -148,24 +114,11 @@ pub(super) enum IrType {
     Unsupported(String),
 }
 
-impl fmt::Display for IrType {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Void => write!(output, "void"),
-            Self::Int => write!(output, "int"),
-            Self::Boolean => write!(output, "boolean"),
-            Self::Char => write!(output, "char"),
-            Self::Object(class) => write!(output, "ref {class}"),
-            Self::Array(component) => write!(output, "array<{component}>"),
-            Self::Unsupported(reason) => write!(output, "unsupported<{reason}>"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IrInstr {
     Param(ValueId, u16, IrType),
     Constant(ValueId, IrConst),
+    Compare(ValueId, IrCompareOp, ValueId, Option<ValueId>),
     Arithmetic(ValueId, IrArithmeticOp, ValueId, ValueId),
     Unary(ValueId, IrUnaryOp, ValueId),
     Branch(BasicBlockId),
@@ -187,44 +140,6 @@ pub(super) enum IrInstr {
     Trap(TrapReason),
 }
 
-impl fmt::Display for IrInstr {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Param(value, local, ty) => write!(output, "param local{local} = {value}: {ty}"),
-            Self::Constant(value, constant) => write!(output, "{value} = const {constant}"),
-            Self::Arithmetic(value, op, lhs, rhs) => write!(output, "{value} = {op} {lhs}, {rhs}"),
-            Self::Unary(value, op, input) => write!(output, "{value} = {op} {input}"),
-            Self::Return(Some(value)) => write!(output, "return {value}"),
-            Self::Return(None) => write!(output, "return"),
-            Self::Branch(target) => write!(output, "branch {target}"),
-            Self::CondBranch(condition, then_target, else_target) => {
-                write!(
-                    output,
-                    "branch_if {condition}, {then_target}, {else_target}"
-                )
-            }
-            Self::ExceptionEdge(exception, target) => {
-                write!(output, "exception_edge {exception} -> {target}")
-            }
-            Self::ZeroCheck(value, reason) => {
-                write!(output, "check_nonzero {value} else trap {reason}")
-            }
-            Self::Trap(reason) => write!(output, "trap {reason}"),
-            Self::Call(..)
-            | Self::RuntimeCall(..)
-            | Self::FieldGet(..)
-            | Self::FieldPut(..)
-            | Self::ArrayLoad(..)
-            | Self::ArrayStore(..)
-            | Self::ArrayLength(..)
-            | Self::NewObject(..)
-            | Self::NewArray(..)
-            | Self::NullCheck(..)
-            | Self::BoundsCheck(..) => write!(output, "{self:?}"),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IrConst {
     Int(i32),
@@ -232,18 +147,6 @@ pub(super) enum IrConst {
     Char(char),
     Null,
     String(Vec<u8>),
-}
-
-impl fmt::Display for IrConst {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Int(value) => write!(output, "int {value}"),
-            Self::Boolean(value) => write!(output, "boolean {value}"),
-            Self::Char(value) => write!(output, "char {value:?}"),
-            Self::Null => write!(output, "null"),
-            Self::String(bytes) => write!(output, "string {bytes:?}"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,29 +158,23 @@ pub(super) enum IrArithmeticOp {
     Rem,
 }
 
-impl fmt::Display for IrArithmeticOp {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Add => write!(output, "add"),
-            Self::Sub => write!(output, "sub"),
-            Self::Mul => write!(output, "mul"),
-            Self::Div => write!(output, "div"),
-            Self::Rem => write!(output, "rem"),
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IrCompareOp {
+    IntEq,
+    IntNe,
+    IntLt,
+    IntGe,
+    IntGt,
+    IntLe,
+    RefEqPlaceholder,
+    RefNePlaceholder,
+    RefIsNullPlaceholder,
+    RefIsNonNullPlaceholder,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IrUnaryOp {
     Neg,
-}
-
-impl fmt::Display for IrUnaryOp {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Neg => write!(output, "neg"),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,15 +206,4 @@ pub(super) enum TrapReason {
     Bounds,
     DivideByZero,
     Unsupported(String),
-}
-
-impl fmt::Display for TrapReason {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NullReference => write!(output, "null_reference"),
-            Self::Bounds => write!(output, "bounds"),
-            Self::DivideByZero => write!(output, "divide_by_zero"),
-            Self::Unsupported(reason) => write!(output, "unsupported<{reason}>"),
-        }
-    }
 }

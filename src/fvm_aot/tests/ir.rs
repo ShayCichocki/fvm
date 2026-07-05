@@ -14,7 +14,7 @@ fn ir_empty_main_snapshot() {
 
     assert_eq!(
         function.render_text(),
-        "fn main -> void {\nbb0:\n  return\n}\n"
+        "fn main -> void {\nbb0 -> []:\n  return\n}\n"
     );
     assert!(function.verify().is_ok());
 }
