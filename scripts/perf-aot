@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FVM="${FVM:-$ROOT/target/release/fvm}"
+APP_DIR="$ROOT/examples/aot-http"
+BUILD_DIR="$APP_DIR/build"
+CLASSES="$BUILD_DIR/classes"
+JAR="$APP_DIR/aot-http.jar"
+ARTIFACT="$APP_DIR/aot-http.fvm"
+KERNEL="${FVM_KERNEL:-$ROOT/.fvm-host-bin/hello-vmlinux.bin}"
+HOST_PORT="${HOST_PORT:-18081}"
+GUEST_PORT="${GUEST_PORT:-9090}"
+ITERATIONS="${ITERATIONS:-10}"
+ROOTFS_SIZE="${ROOTFS_SIZE:-32M}"
+HOST_MEMORY="${HOST_MEMORY:-32G}"
+RESERVE="${RESERVE:-2G}"
+BASELINE_HOST_RSS="${BASELINE_HOST_RSS:-256M}"
+BASELINE_BOOT_MS="${BASELINE_BOOT_MS:-5000}"
+JAVA_RELEASE="${JAVA_RELEASE:-17}"
+RESULT_DIR="${RESULT_DIR:-$ROOT/perf-results/aot-$(date +%Y%m%d-%H%M%S)}"
+
+usage() {
+  cat <<EOF
+Usage: ITERATIONS=3 FVM_KERNEL=/path/to/vmlinux scripts/perf-aot
+
+Builds examples/aot-http with fvm build --backend fvm-aot, runs the current
+cold HTTP benchmark, and writes timings.env, sizes.env, inspect.txt, and
+aot-math.txt under RESULT_DIR.
+
+Required host prerequisites for benchmark execution:
+  Linux x86_64 with KVM available at /dev/kvm
+  Firecracker and TAP networking access verified by fvm doctor --strict
+  FVM_KERNEL pointing to a Firecracker-compatible Linux kernel image
+  javac, jar, cc, and ext4 tooling on PATH
+
+Environment:
+  FVM             fvm binary (default: $ROOT/target/release/fvm)
+  FVM_KERNEL      Firecracker kernel image (default: $ROOT/.fvm-host-bin/hello-vmlinux.bin)
+  HOST_PORT       forwarded host HTTP port (default: 18081)
+  GUEST_PORT      aot-http guest HTTP port from source (default: 9090)
+  ITERATIONS      fvm run --benchmark-iterations value (default: 10)
+  ROOTFS_SIZE     fvm build --rootfs-size value (default: 32M)
+  RESULT_DIR      result directory (default: $ROOT/perf-results/aot-<timestamp>)
+  JAVA_RELEASE    javac --release value (default: 17)
+  HOST_MEMORY     fvm math --host-memory value (default: 32G)
+  RESERVE         fvm math --reserve value (default: 2G)
+  BASELINE_HOST_RSS  fvm math baseline host RSS (default: 256M)
+  BASELINE_BOOT_MS   fvm math baseline boot ms (default: 5000)
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ ! -f "$KERNEL" ]]; then
+  echo "missing kernel: $KERNEL" >&2
+  echo "set FVM_KERNEL=/path/to/firecracker/kernel" >&2
+  echo "real fvm-aot benchmarks require Linux/KVM; macOS is build/test/dry-run only" >&2
+  exit 1
+fi
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Linux/KVM prerequisite missing: fvm-aot benchmarks require a Linux x86_64 host with /dev/kvm" >&2
+  echo "macOS is build/test/dry-run only; run this script on the Linux/KVM benchmark host" >&2
+  exit 1
+fi
+
+if [[ ! -e /dev/kvm ]]; then
+  echo "Linux/KVM prerequisite missing: /dev/kvm is not available" >&2
+  exit 1
+fi
+
+if [[ ! -x "$FVM" ]]; then
+  echo "missing fvm binary: $FVM" >&2
+  echo "run: cargo build --release" >&2
+  exit 1
+fi
+
+for executable in javac jar cc; do
+  if ! command -v "$executable" >/dev/null 2>&1; then
+    echo "Linux/KVM prerequisite missing: $executable is not on PATH" >&2
+    exit 1
+  fi
+done
+
+ms_now() {
+  date +%s%3N
+}
+
+measure() {
+  local name="$1"
+  shift
+  local log="$RESULT_DIR/$name.log"
+  local start end elapsed
+  start="$(ms_now)"
+  "$@" >"$log" 2>&1
+  end="$(ms_now)"
+  elapsed=$((end - start))
+  printf "%s_ms=%s\n" "$name" "$elapsed" | tee -a "$RESULT_DIR/timings.env"
+}
+
+size_line() {
+  local key="$1"
+  local path="$2"
+  if [[ -e "$path" ]]; then
+    printf "%s_bytes=%s\n" "$key" "$(stat -c%s "$path")" | tee -a "$RESULT_DIR/sizes.env"
+  fi
+}
+
+record_math_summary() {
+  local math_file="$1"
+  awk '
+    /^iterations:/ { print "aot_cold_iterations=" $2 }
+    /^boot median:/ {
+      value = $3; gsub(/[^0-9]/, "", value);
+      if (value != "") print "aot_cold_boot_median_ms=" value
+    }
+    /^boot p90:/ {
+      value = $3; gsub(/[^0-9]/, "", value);
+      if (value != "") print "aot_cold_boot_p90_ms=" value
+    }
+    /^boot p99:/ {
+      value = $3; gsub(/[^0-9]/, "", value);
+      if (value != "") print "aot_cold_boot_p99_ms=" value
+    }
+    /^host rss max:/ {
+      value = $4; gsub(/[^0-9.]/, "", value);
+      if (value != "") print "aot_cold_host_rss_max_mib=" value
+    }
+    /^guest rss max:/ {
+      value = $4; gsub(/[^0-9.]/, "", value);
+      if (value != "") print "aot_cold_guest_rss_max_mib=" value
+    }
+  ' "$math_file" | tee -a "$RESULT_DIR/timings.env"
+}
+
+compile_app() {
+  rm -rf "$CLASSES"
+  mkdir -p "$CLASSES"
+  javac --release "$JAVA_RELEASE" \
+    -d "$CLASSES" \
+    "$APP_DIR/src/AotHttp.java" \
+    "$APP_DIR/src/AotConfig.java" \
+    "$APP_DIR/src/AotHandler.java" \
+    "$APP_DIR/src/AotResponder.java" \
+    "$APP_DIR/src/fvm/runtime/Http.java"
+  jar --create --file "$JAR" --main-class AotHttp -C "$CLASSES" .
+}
+
+fvm_build() {
+  "$FVM" build "$JAR" \
+    --backend fvm-aot \
+    --force \
+    --output "$ARTIFACT" \
+    --kernel "$KERNEL" \
+    --port "$HOST_PORT:$GUEST_PORT" \
+    --readiness-http /health \
+    --rootfs-size "$ROOTFS_SIZE"
+}
+
+fvm_cold() {
+  "$FVM" run "$ARTIFACT" \
+    --once \
+    --port "$HOST_PORT:$GUEST_PORT" \
+    --wait-http /health \
+    --readiness-timeout 45 \
+    --benchmark-iterations "$ITERATIONS"
+}
+
+mkdir -p "$RESULT_DIR"
+rm -f "$RESULT_DIR/timings.env" "$RESULT_DIR/sizes.env"
+
+echo "result_dir=$RESULT_DIR"
+"$FVM" doctor --strict | tee "$RESULT_DIR/doctor.log"
+
+measure compile_app compile_app
+size_line jar "$JAR"
+
+measure fvm_build fvm_build
+size_line artifact_app_bin "$ARTIFACT/app.bin"
+size_line artifact_rootfs "$ARTIFACT/rootfs.ext4"
+size_line artifact_kernel "$ARTIFACT/kernel"
+du -sm "$ARTIFACT" | awk '{print "artifact_du_mib=" $1}' | tee -a "$RESULT_DIR/sizes.env"
+
+measure aot_cold_benchmark fvm_cold
+"$FVM" math "$ARTIFACT" \
+  --host-memory "$HOST_MEMORY" \
+  --reserve "$RESERVE" \
+  --baseline-host-rss "$BASELINE_HOST_RSS" \
+  --baseline-boot-ms "$BASELINE_BOOT_MS" | tee "$RESULT_DIR/aot-math.txt"
+record_math_summary "$RESULT_DIR/aot-math.txt"
+
+"$FVM" inspect "$ARTIFACT" --verify | tee "$RESULT_DIR/inspect.txt"
+
+echo "wrote results to $RESULT_DIR"
