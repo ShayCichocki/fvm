@@ -3,6 +3,7 @@ mod classfile;
 mod diagnostics;
 mod emitter;
 mod evaluator;
+mod ir;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -127,6 +128,7 @@ mod tests {
     mod current_slice;
     mod differential;
     mod failure_artifacts;
+    mod ir;
     mod unsupported;
 
     #[test]

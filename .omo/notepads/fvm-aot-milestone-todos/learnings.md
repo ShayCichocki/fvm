@@ -38,3 +38,10 @@ Added ignored integration coverage in `tests/aot_firecracker.rs` for the real `f
 
 ## 2026-07-05T04:05:00Z Task: T12 perf-aot wrapper
 Added `scripts/perf-aot` as the current AOT HTTP benchmark wrapper. It compiles all `examples/aot-http/src` Java sources, packages `aot-http.jar` with main class `AotHttp`, builds `aot-http.fvm` through `fvm build --backend fvm-aot`, runs the cold `/health` benchmark with `--benchmark-iterations "$ITERATIONS"`, and writes `timings.env`, `sizes.env`, `inspect.txt`, and `aot-math.txt` under `perf-results/aot-*`. The default guest port is `9090`, derived from the committed source path `Http.respond(responder.port(), responder.body())` via `AotConfig(9000, ...)` and offsets `{40, 50}`. Local macOS verification covered `bash -n`, `--help`, and a missing-kernel failure that exits 1 with an actionable message; no Linux/KVM benchmark success is claimed. Final `cargo fmt --check && cargo test && cargo clippy --all-targets -- -D warnings` passed.
+
+## 2026-07-05T05:07:40Z Task: T13 runtime compiler IR model
+Added the model-only runtime compiler IR in `src/fvm_aot/ir.rs` plus `src/fvm_aot/tests/ir.rs` for the empty-main snapshot and invalid branch target verifier path. The IR stays unwired from `compile_jar`; T14-T18 own lowering/codegen/reachability.
+
+`src/fvm_aot/ir.rs` stays at 226 pure LOC by keeping tests in the existing AOT test module tree. It has a scoped `#![allow(dead_code)]` because this milestone intentionally introduces the typed model before future tasks add production users; `cargo clippy --all-targets -- -D warnings` passes with that scoped allowance.
+
+Final verification passed: `cargo test ir_empty_main_snapshot -- --nocapture`, `cargo test ir_ -- --nocapture`, `cargo fmt --check`, `cargo test`, and `cargo clippy --all-targets -- -D warnings`. LSP diagnostics still timed out at `/Users/scichocki/.codex/codex-lsp/daemon/v0.1.0/daemon.sock`.
