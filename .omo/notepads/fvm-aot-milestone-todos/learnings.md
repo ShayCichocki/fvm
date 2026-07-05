@@ -1,0 +1,25 @@
+## 2026-07-04 Task: init
+Initialized notepad for fvm-aot-milestone-todos. Plan requires delegated execution only; Atlas must not edit product files.
+
+## 2026-07-04T22:08:15Z Task: T01 clean baseline
+Baseline validation passed before product edits. `git status --short --untracked-files=all` showed only `.omo/**` planning/runtime files, including `.omo/run-continuation/*.json`, all explicitly excluded from staging, deletion, cleanup, or product-edit scope.
+
+Required command results: `GIT_MASTER=1 git status --short --untracked-files=all` exit 0, `cargo fmt --check` exit 0, `cargo test` exit 0, and `cargo clippy --all-targets -- -D warnings` exit 0. Full transcript is in `.omo/evidence/task-01-fvm-aot-milestone-todos.md`.
+
+## 2026-07-04T22:31:37Z Task: T02 classfile split
+Moved classfile frontend parsing into `src/fvm_aot/classfile.rs` while keeping evaluator/emitter code and public `compile_jar` in `src/fvm_aot/mod.rs`. `ClassFile::parse(b"nope")` behavior stayed covered by `fvm_aot::tests::rejects_invalid_classfile`; final `cargo fmt --check`, targeted parser test, full `cargo test`, and `cargo clippy --all-targets -- -D warnings` all passed. LSP daemon timed out, so cargo/clippy are the available code diagnostics.
+
+## 2026-07-04T22:56:43Z Task: T03 unsupported diagnostics split
+Extracted `unsupported_opcode_message` to `src/fvm_aot/diagnostics.rs` and JVM descriptor/type helpers to `src/fvm_aot/types.rs`; evaluator/emitter/classfile behavior stayed in `src/fvm_aot/mod.rs`. Baseline and final `cargo test unsupported_ -- --nocapture`, full `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` passed. Product commit: `24a32cd aot: isolate unsupported diagnostics`. LSP remained unavailable (`rust-analyzer` missing/timeouts), so cargo/clippy remain the reliable diagnostics.
+
+## 2026-07-04T23:35:00Z Task: T04 evaluator extraction
+Extracted build-time evaluator state and helpers into `src/fvm_aot/evaluator.rs`; `src/fvm_aot/mod.rs` now keeps `compile_jar`, class-world loading, C emitter, and tests. Baseline println/HTTP smoke tests and dynamic loading unsupported test passed before edits. Final `cargo test compiles_ -- --nocapture`, `cargo test unsupported_dynamic_class_loading_reports_required_feature -- --nocapture`, `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` passed. Product commit: `1fec2ca aot: isolate build-time evaluator`. LSP daemon timed out again, so cargo/clippy remain the reliable diagnostics. Evidence: `.omo/evidence/task-04-fvm-aot-milestone-todos.md`.
+
+## 2026-07-04T23:42:12Z Task: T05 generated C emitter extraction
+Extracted the stopgap generated C emitter into `src/fvm_aot/emitter.rs` with only `pub(super) emit_c` exposed back to `mod.rs`; generated C strings for native println and HTTP server were moved unchanged. Combined cargo smoke filter was rejected by Cargo, so the two filters were run separately before edits and passed. Final `cargo fmt --check`, both specific smoke filters, `cargo test compiles_ -- --nocapture`, full `cargo test`, and `cargo clippy --all-targets -- -D warnings` passed. LSP daemon still times out; cargo/clippy remain the reliable diagnostics. Evidence: `.omo/evidence/task-05-fvm-aot-milestone-todos.md`.
+
+## 2026-07-04T23:59:00Z Task: T06 shared AOT fixtures
+Extracted shared AOT test fixture mechanics into `src/fvm_aot/test_support.rs` under `#[cfg(test)]`: source writing, `javac --release 17`, JAR packaging, native compile/run, HotSpot baseline, HTTP wait/cleanup, missing-source error assertion, and artifact preservation hooks. Existing `fvm_aot::tests` still run as 13 focused tests with the same unsupported diagnostic substrings and exact native stdout/HTTP body expectations. Final `cargo fmt --check`, `cargo test fvm_aot::tests -- --nocapture`, full `cargo test`, and `cargo clippy --all-targets -- -D warnings` passed. LSP daemon still times out; cargo/clippy remain the reliable diagnostics.
+
+## 2026-07-05T00:22:00Z Task: T07 current AOT slice
+Moved the seven supported behavior fixtures into `src/fvm_aot/tests/current_slice.rs` via `mod current_slice`, leaving unsupported diagnostic tests in `src/fvm_aot/mod.rs`. `cargo test current_slice -- --nocapture` now runs the supported subset for println, computed HTTP, statics/clinit, objects/arrays, multi-class closed world, interface dispatch/string concat, and String/Object/array core methods. Missing `cc`/`javac` handling for supported fixtures now prints an explicit skip reason; a controlled PATH without `cc` passed with seven skip messages. LSP daemon still timed out, so final diagnostics rely on cargo, clippy, and rustfmt.
