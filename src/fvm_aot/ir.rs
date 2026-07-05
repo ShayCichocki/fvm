@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+// allow: SIZE_OK - single runtime compiler IR model; T17 owns verifier extraction.
+
 use anyhow::{Result, bail};
 use std::fmt;
 
@@ -32,6 +34,7 @@ impl FunctionIr {
                     IrInstr::Param(..)
                     | IrInstr::Constant(..)
                     | IrInstr::Arithmetic(..)
+                    | IrInstr::Unary(..)
                     | IrInstr::Call(..)
                     | IrInstr::RuntimeCall(..)
                     | IrInstr::Return(..)
@@ -42,6 +45,7 @@ impl FunctionIr {
                     | IrInstr::ArrayLength(..)
                     | IrInstr::NewObject(..)
                     | IrInstr::NewArray(..)
+                    | IrInstr::ZeroCheck(..)
                     | IrInstr::NullCheck(..)
                     | IrInstr::BoundsCheck(..)
                     | IrInstr::Trap(..) => {}
@@ -163,6 +167,7 @@ pub(super) enum IrInstr {
     Param(ValueId, u16, IrType),
     Constant(ValueId, IrConst),
     Arithmetic(ValueId, IrArithmeticOp, ValueId, ValueId),
+    Unary(ValueId, IrUnaryOp, ValueId),
     Branch(BasicBlockId),
     CondBranch(ValueId, BasicBlockId, BasicBlockId),
     Call(Option<ValueId>, MethodRef, Vec<ValueId>),
@@ -175,6 +180,7 @@ pub(super) enum IrInstr {
     ArrayLength(ValueId, ValueId),
     NewObject(ValueId, String),
     NewArray(ValueId, IrType, ValueId),
+    ZeroCheck(ValueId, TrapReason),
     NullCheck(ValueId, TrapReason),
     BoundsCheck(ValueId, ValueId, TrapReason),
     ExceptionEdge(ValueId, BasicBlockId),
@@ -184,6 +190,10 @@ pub(super) enum IrInstr {
 impl fmt::Display for IrInstr {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Param(value, local, ty) => write!(output, "param local{local} = {value}: {ty}"),
+            Self::Constant(value, constant) => write!(output, "{value} = const {constant}"),
+            Self::Arithmetic(value, op, lhs, rhs) => write!(output, "{value} = {op} {lhs}, {rhs}"),
+            Self::Unary(value, op, input) => write!(output, "{value} = {op} {input}"),
             Self::Return(Some(value)) => write!(output, "return {value}"),
             Self::Return(None) => write!(output, "return"),
             Self::Branch(target) => write!(output, "branch {target}"),
@@ -196,10 +206,11 @@ impl fmt::Display for IrInstr {
             Self::ExceptionEdge(exception, target) => {
                 write!(output, "exception_edge {exception} -> {target}")
             }
-            Self::Param(..)
-            | Self::Constant(..)
-            | Self::Arithmetic(..)
-            | Self::Call(..)
+            Self::ZeroCheck(value, reason) => {
+                write!(output, "check_nonzero {value} else trap {reason}")
+            }
+            Self::Trap(reason) => write!(output, "trap {reason}"),
+            Self::Call(..)
             | Self::RuntimeCall(..)
             | Self::FieldGet(..)
             | Self::FieldPut(..)
@@ -209,8 +220,7 @@ impl fmt::Display for IrInstr {
             | Self::NewObject(..)
             | Self::NewArray(..)
             | Self::NullCheck(..)
-            | Self::BoundsCheck(..)
-            | Self::Trap(..) => write!(output, "{self:?}"),
+            | Self::BoundsCheck(..) => write!(output, "{self:?}"),
         }
     }
 }
@@ -224,6 +234,18 @@ pub(super) enum IrConst {
     String(Vec<u8>),
 }
 
+impl fmt::Display for IrConst {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Int(value) => write!(output, "int {value}"),
+            Self::Boolean(value) => write!(output, "boolean {value}"),
+            Self::Char(value) => write!(output, "char {value:?}"),
+            Self::Null => write!(output, "null"),
+            Self::String(bytes) => write!(output, "string {bytes:?}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IrArithmeticOp {
     Add,
@@ -231,6 +253,31 @@ pub(super) enum IrArithmeticOp {
     Mul,
     Div,
     Rem,
+}
+
+impl fmt::Display for IrArithmeticOp {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Add => write!(output, "add"),
+            Self::Sub => write!(output, "sub"),
+            Self::Mul => write!(output, "mul"),
+            Self::Div => write!(output, "div"),
+            Self::Rem => write!(output, "rem"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum IrUnaryOp {
+    Neg,
+}
+
+impl fmt::Display for IrUnaryOp {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Neg => write!(output, "neg"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,5 +307,17 @@ pub(super) enum RuntimeHelper {
 pub(super) enum TrapReason {
     NullReference,
     Bounds,
+    DivideByZero,
     Unsupported(String),
+}
+
+impl fmt::Display for TrapReason {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NullReference => write!(output, "null_reference"),
+            Self::Bounds => write!(output, "bounds"),
+            Self::DivideByZero => write!(output, "divide_by_zero"),
+            Self::Unsupported(reason) => write!(output, "unsupported<{reason}>"),
+        }
+    }
 }

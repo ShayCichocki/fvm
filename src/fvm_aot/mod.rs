@@ -5,6 +5,8 @@ mod emitter;
 mod evaluator;
 mod ir;
 #[cfg(test)]
+mod lower;
+#[cfg(test)]
 mod test_support;
 mod types;
 use classfile::ClassFile;
@@ -129,6 +131,7 @@ mod tests {
     mod differential;
     mod failure_artifacts;
     mod ir;
+    mod lower;
     mod unsupported;
 
     #[test]
