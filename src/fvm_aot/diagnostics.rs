@@ -69,6 +69,7 @@ pub(super) fn unsupported_opcode_message(opcode: u8) -> String {
             Some(("int bitwise and shift opcodes", "primitive-completeness"))
         }
         0xaa | 0xab => Some(("switch bytecodes", "primitive-completeness")),
+        0xbb..=0xbf => Some(("runtime allocation", "runtime-allocation")),
         0xc1 => Some(("instanceof", "primitive-completeness")),
         0xc2 | 0xc3 => Some(("monitors/synchronization", "concurrency-profile")),
         0xc4 => Some(("wide local-variable bytecodes", "primitive-completeness")),

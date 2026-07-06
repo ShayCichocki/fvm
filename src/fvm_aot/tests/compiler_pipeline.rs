@@ -1,8 +1,114 @@
-use crate::fvm_aot::compiler::CompilerPipeline;
+use crate::fvm_aot::compiler::{CompilerPipeline, StaticIntMethodSpec};
 use crate::fvm_aot::test_support::{
-    AotFixture, ClassEntry, JarSpec, JavaSource, NativeSpec, command_available,
+    AotFixture, ClassEntry, JarSpec, JavaSource, NativeSpec, command_available, run_hotspot,
 };
 use anyhow::Result;
+use std::process::Command;
+
+#[test]
+fn cranelift_static_int_method_matches_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotCraneliftStaticInt.java",
+        contents: r#"public final class AotCraneliftStaticInt {
+    static int helper() {
+        return 40 + 2;
+    }
+
+    static int entry() {
+        return helper();
+    }
+
+    public static void main(String[] args) {
+        System.out.println(entry());
+    }
+}
+"#,
+    }])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-static-int.jar",
+            main_class: "AotCraneliftStaticInt",
+            entries: &[ClassEntry {
+                jar_entry: "AotCraneliftStaticInt.class",
+                class_relative_path: "AotCraneliftStaticInt.class",
+            }],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotCraneliftStaticInt")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected = String::from_utf8(hotspot.stdout)?.trim().parse::<i32>()?;
+
+    let native = CompilerPipeline::from_jar(&jar, "AotCraneliftStaticInt")?
+        .compile_static_int_method(&StaticIntMethodSpec {
+            class: "AotCraneliftStaticInt",
+            name: "entry",
+            descriptor: "()I",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-static-int-native"),
+        })?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(expected));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cranelift_static_int_rejects_object_allocation_with_runtime_milestone() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotCraneliftAlloc.java",
+        contents: r#"public final class AotCraneliftAlloc {
+    static int entry() {
+        Object value = new Object();
+        return value == null ? 0 : 1;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(entry());
+    }
+}
+"#,
+    }])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-allocation.jar",
+            main_class: "AotCraneliftAlloc",
+            entries: &[ClassEntry {
+                jar_entry: "AotCraneliftAlloc.class",
+                class_relative_path: "AotCraneliftAlloc.class",
+            }],
+        },
+    )?;
+
+    let err = CompilerPipeline::from_jar(&jar, "AotCraneliftAlloc")?
+        .compile_static_int_method(&StaticIntMethodSpec {
+            class: "AotCraneliftAlloc",
+            name: "entry",
+            descriptor: "()I",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-allocation-native"),
+        })
+        .unwrap_err();
+    let message = format!("{err:#}");
+    println!("{message}");
+
+    assert!(message.contains("runtime allocation"), "{message}");
+    assert!(message.contains("runtime-allocation"), "{message}");
+    Ok(())
+}
 
 #[test]
 fn compiler_pipeline_lowers_simple_main() -> Result<()> {
@@ -147,9 +253,9 @@ fn compiler_pipeline_reports_unsupported_long_before_codegen() -> Result<()> {
 }
 
 fn skip_missing_toolchain() -> bool {
-    if command_available("javac") {
+    if command_available("javac") && command_available("java") && command_available("cc") {
         return false;
     }
-    println!("skipping fvm-aot compiler pipeline test because required tool is missing: javac");
+    println!("skipping fvm-aot compiler pipeline test because javac, java, or cc is missing");
     true
 }

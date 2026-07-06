@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+mod static_int;
+
 use super::classfile::{ClassFile, Method};
 use super::lower::lower_method_to_ir;
 use super::reachability::analyze_main;
@@ -7,6 +9,8 @@ use super::{ClassWorld, read_class_world};
 use anyhow::Result;
 use std::fmt::Write;
 use std::path::Path;
+
+pub(super) use static_int::StaticIntMethodSpec;
 
 pub(super) struct CompilerPipeline {
     world: ClassWorld,

@@ -1,6 +1,6 @@
 use crate::fvm_aot::codegen::cranelift::emit_object;
 use crate::fvm_aot::ir::{
-    BasicBlockId, BasicBlockIr, FunctionIr, IrArithmeticOp, IrConst, IrInstr, IrType, ValueId,
+    BasicBlockId, BasicBlockIr, FunctionIr, IrConst, IrInstr, IrType, ValueId,
 };
 use cranelift_object::object::{Object, ObjectSymbol};
 
@@ -35,17 +35,11 @@ fn cranelift_emits_constant_return_object() -> anyhow::Result<()> {
 #[test]
 fn cranelift_rejects_unsupported_instruction() {
     let function = int_function(
-        "Codegen.unsupportedArithmetic",
+        "Codegen.unsupportedAllocation",
         vec![
-            IrInstr::Constant(ValueId::new(0), IrConst::Int(40)),
-            IrInstr::Constant(ValueId::new(1), IrConst::Int(2)),
-            IrInstr::Arithmetic(
-                ValueId::new(2),
-                IrArithmeticOp::Add,
-                ValueId::new(0),
-                ValueId::new(1),
-            ),
-            IrInstr::Return(Some(ValueId::new(2))),
+            IrInstr::NewObject(ValueId::new(0), "CodegenObject".to_string()),
+            IrInstr::Constant(ValueId::new(1), IrConst::Int(42)),
+            IrInstr::Return(Some(ValueId::new(1))),
         ],
     );
 
@@ -53,8 +47,9 @@ fn cranelift_rejects_unsupported_instruction() {
     println!("{message}");
 
     assert!(message.contains("unsupported-codegen"));
-    assert!(message.contains("Codegen.unsupportedArithmetic()I"));
-    assert!(message.contains("instruction=Arithmetic"));
+    assert!(message.contains("Codegen.unsupportedAllocation()I"));
+    assert!(message.contains("instruction=NewObject"));
+    assert!(message.contains("runtime-allocation"));
 }
 
 fn int_function(name: &str, instrs: Vec<IrInstr>) -> FunctionIr {
