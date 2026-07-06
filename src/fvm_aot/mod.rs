@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 mod classfile;
+mod codegen;
 #[cfg(test)]
 mod compiler;
 mod diagnostics;
@@ -131,6 +132,7 @@ fn make_executable(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    mod codegen_cranelift;
     mod compiler_pipeline;
     mod current_slice;
     mod differential;
