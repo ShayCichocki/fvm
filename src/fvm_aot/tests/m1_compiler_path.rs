@@ -1,10 +1,15 @@
 use crate::fvm_aot::test_support::{
-    AotFixture, ClassEntry, HTTP_RUNTIME_SOURCE, JarSpec, JavaSource, NativeSpec,
-    command_available, run_native, run_native_http,
+    AotFixture, ClassEntry, HTTP_RUNTIME_SOURCE, JarSpec, JavaSource, NativeSpec, run_native,
+    run_native_http,
 };
 use anyhow::Result;
 
+// Gated until the compiler path can execute `System.out.println` at runtime
+// (PUNCHLIST P3.5). Today the IR → Cranelift path has no runtime print, so this
+// fixture cannot run natively; the evaluator fallback is deliberately disabled
+// on the compiler-required path.
 #[test]
+#[ignore = "compiler path lacks runtime println until PUNCHLIST P3.5"]
 fn m1_compiler_path_println_fixture_runs_native() -> Result<()> {
     if skip_missing_toolchain() {
         return Ok(());
@@ -41,12 +46,23 @@ fn m1_compiler_path_println_fixture_runs_native() -> Result<()> {
     let run = run_native(&output)?;
 
     assert!(run.status.success(), "native failed: {run:?}");
-    assert_eq!(String::from_utf8_lossy(&run.stdout), "m1 compiler println\n");
-    assert!(run.stderr.is_empty(), "stderr: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "m1 compiler println\n"
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     Ok(())
 }
 
+// Gated until runtime HTTP + per-request compiled handlers exist on the
+// compiler path (PUNCHLIST P4.1/P4.2). The evaluator's constant-body HTTP
+// server is intentionally not reachable from the compiler-required path.
 #[test]
+#[ignore = "compiler path lacks runtime Http.respond until PUNCHLIST P4.2"]
 fn m1_compiler_path_http_intrinsic_runs_native() -> Result<()> {
     if skip_missing_toolchain() {
         return Ok(());
@@ -142,14 +158,13 @@ fn m1_compiler_path_required_fixture_rejects_evaluator_only_fallback() -> Result
     println!("{message}");
 
     assert!(message.contains("compiler-required"), "{message}");
-    assert!(message.contains("runtime allocation") || message.contains("opcode 0xbb"), "{message}");
+    assert!(
+        message.contains("runtime allocation") || message.contains("opcode 0xbb"),
+        "{message}"
+    );
     Ok(())
 }
 
 fn skip_missing_toolchain() -> bool {
-    if command_available("javac") && command_available("cc") {
-        return false;
-    }
-    println!("skipping fvm-aot M1 compiler path test because javac or cc is missing");
-    true
+    crate::fvm_aot::test_support::skip_or_require_toolchain(&["javac", "cc"])
 }

@@ -1,8 +1,6 @@
 use crate::fvm_aot::classfile::ClassFile;
 use crate::fvm_aot::reachability::analyze_main;
-use crate::fvm_aot::test_support::{
-    AotFixture, ClassEntry, JarSpec, JavaSource, command_available,
-};
+use crate::fvm_aot::test_support::{AotFixture, ClassEntry, JarSpec, JavaSource};
 use crate::fvm_aot::{ClassWorld, read_class_world};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -121,9 +119,5 @@ fn parse_class(class_path: &std::path::Path) -> Result<ClassFile> {
 }
 
 fn skip_missing_toolchain() -> bool {
-    if command_available("javac") {
-        return false;
-    }
-    println!("skipping fvm-aot reachability test because required tool is missing: javac");
-    true
+    crate::fvm_aot::test_support::skip_or_require_toolchain(&["javac"])
 }

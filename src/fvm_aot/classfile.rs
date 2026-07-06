@@ -116,7 +116,7 @@ impl ClassFile {
                 1 => {
                     let len = reader.u2()? as usize;
                     let bytes = reader.bytes(len)?;
-                    Constant::Utf8(String::from_utf8_lossy(bytes).to_string())
+                    Constant::Utf8(decode_modified_utf8(bytes)?)
                 }
                 3 => Constant::Integer(reader.u4()? as i32),
                 4 => {
@@ -531,5 +531,99 @@ impl<'a> Reader<'a> {
             );
         }
         Ok(())
+    }
+}
+
+/// Decode a JVM `CONSTANT_Utf8` byte string, which is encoded in *Modified
+/// UTF-8* (JVMS §4.4.7), a.k.a. CESU-8.
+///
+/// Modified UTF-8 differs from standard UTF-8 in two ways that
+/// `String::from_utf8_lossy` silently corrupts:
+///   - the NUL code point (U+0000) is encoded as the two bytes `0xC0 0x80`;
+///   - supplementary code points (U+10000..) are encoded as a UTF-16 surrogate
+///     pair, each surrogate emitted as a 3-byte sequence — there is no 4-byte
+///     form.
+///
+/// We decode the raw bytes into UTF-16 code units, then materialize a Rust
+/// `String`. Every valid code point — NUL, BMP, and paired-surrogate
+/// supplementary characters — round-trips faithfully, which is exactly the
+/// UTF-16-faithful model the runtime string work (Phase 3) builds on. Unpaired
+/// surrogates (representable only via `\uD800`-style source escapes and absent
+/// from any javac-emitted name/descriptor) become U+FFFD, the one residual
+/// lossy case; Phase 3's dedicated `char[]` model will preserve them.
+fn decode_modified_utf8(bytes: &[u8]) -> Result<String> {
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        if b0 & 0x80 == 0 {
+            units.push(u16::from(b0));
+            i += 1;
+        } else if b0 & 0xE0 == 0xC0 {
+            let b1 = continuation_byte(bytes, i + 1)?;
+            units.push((u16::from(b0 & 0x1F) << 6) | u16::from(b1 & 0x3F));
+            i += 2;
+        } else if b0 & 0xF0 == 0xE0 {
+            let b1 = continuation_byte(bytes, i + 1)?;
+            let b2 = continuation_byte(bytes, i + 2)?;
+            units.push(
+                (u16::from(b0 & 0x0F) << 12) | (u16::from(b1 & 0x3F) << 6) | u16::from(b2 & 0x3F),
+            );
+            i += 3;
+        } else {
+            bail!("invalid modified-UTF-8 leading byte 0x{b0:02x} at offset {i}");
+        }
+    }
+    Ok(String::from_utf16_lossy(&units))
+}
+
+fn continuation_byte(bytes: &[u8], index: usize) -> Result<u8> {
+    let byte = *bytes
+        .get(index)
+        .context("truncated modified-UTF-8 multibyte sequence")?;
+    if byte & 0xC0 != 0x80 {
+        bail!("invalid modified-UTF-8 continuation byte 0x{byte:02x} at offset {index}");
+    }
+    Ok(byte)
+}
+
+#[cfg(test)]
+mod modified_utf8_tests {
+    use super::decode_modified_utf8;
+
+    #[test]
+    fn decodes_ascii_identically() {
+        assert_eq!(
+            decode_modified_utf8(b"java/lang/String").unwrap(),
+            "java/lang/String"
+        );
+    }
+
+    #[test]
+    fn decodes_nul_from_two_byte_form() {
+        // Modified UTF-8 encodes U+0000 as 0xC0 0x80, not a bare 0x00.
+        assert_eq!(decode_modified_utf8(&[0xC0, 0x80]).unwrap(), "\u{0000}");
+    }
+
+    #[test]
+    fn decodes_supplementary_char_from_surrogate_pair() {
+        // U+1F600 😀 as a CESU-8 surrogate pair: D83D DE00, each a 3-byte form.
+        let bytes = [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        let decoded = decode_modified_utf8(&bytes).unwrap();
+        assert_eq!(decoded, "\u{1F600}");
+        // Faithful round-trip: one scalar, two UTF-16 units (Java length()).
+        assert_eq!(decoded.chars().count(), 1);
+        assert_eq!(decoded.encode_utf16().count(), 2);
+    }
+
+    #[test]
+    fn decodes_two_byte_bmp_char() {
+        // U+00E9 é encoded as 0xC3 0xA9.
+        assert_eq!(decode_modified_utf8(&[0xC3, 0xA9]).unwrap(), "é");
+    }
+
+    #[test]
+    fn rejects_truncated_sequence() {
+        assert!(decode_modified_utf8(&[0xC0]).is_err());
     }
 }

@@ -1,6 +1,6 @@
 use crate::fvm_aot::classfile::{ClassFile, Method};
 use crate::fvm_aot::lower::lower_method_to_ir;
-use crate::fvm_aot::test_support::{AotFixture, JavaSource, command_available, run_hotspot};
+use crate::fvm_aot::test_support::{AotFixture, JavaSource, run_hotspot};
 use anyhow::{Context, Result};
 
 #[test]
@@ -257,17 +257,5 @@ fn find_branch_bci(code: &[u8]) -> Result<usize> {
 }
 
 fn skip_missing_toolchain() -> bool {
-    let missing = ["javac", "java"]
-        .iter()
-        .copied()
-        .filter(|command| !command_available(command))
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return false;
-    }
-    println!(
-        "skipping fvm-aot lowerer test because required tool(s) are missing: {}",
-        missing.join(", ")
-    );
-    true
+    crate::fvm_aot::test_support::skip_or_require_toolchain(&["javac", "java"])
 }

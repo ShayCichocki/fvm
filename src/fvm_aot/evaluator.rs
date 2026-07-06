@@ -782,8 +782,10 @@ impl Evaluator<'_> {
             }
             ("contains", "(Ljava/lang/CharSequence;)Z") => {
                 let needle = arg_string(args, 0)?;
+                // Java: "x".contains("") is true. `windows(0)` panics, so the
+                // empty-needle case must be handled explicitly.
                 Ok(Some(Value::Bool(
-                    bytes.windows(needle.len()).any(|window| window == needle),
+                    needle.is_empty() || bytes.windows(needle.len()).any(|window| window == needle),
                 )))
             }
             ("substring", "(I)Ljava/lang/String;") => {

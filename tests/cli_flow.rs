@@ -110,14 +110,14 @@ fn doctor_non_strict_is_laptop_safe() {
 
 #[test]
 fn fvm_aot_dry_run_builds_supported_println_subset() {
-    if !command_available("javac") {
+    if skip_missing_javac() {
         return;
     }
 
     let temp = tempfile::tempdir().unwrap();
     let jar = temp.path().join("aot.jar");
     let artifact = temp.path().join("aot.fvm");
-    let Some(class_file) = compile_java_class(
+    let class_file = compile_java_class(
         temp.path(),
         "AotApp",
         r#"public final class AotApp {
@@ -126,9 +126,7 @@ fn fvm_aot_dry_run_builds_supported_println_subset() {
     }
 }
 "#,
-    ) else {
-        return;
-    };
+    );
     write_test_jar_from_class(&jar, "AotApp", &class_file);
 
     run_ok(
@@ -187,13 +185,31 @@ fn command_available(name: &str) -> bool {
     Command::new(name).arg("--version").output().is_ok()
 }
 
-fn compile_java_class(temp: &Path, class_name: &str, source: &str) -> Option<PathBuf> {
+/// Returns `true` if the test should skip because `javac` is missing. When
+/// `FVM_AOT_REQUIRE_TOOLCHAIN=1` (CI), a missing toolchain is a hard failure
+/// instead of a silent skip (PUNCHLIST P0.4).
+fn skip_missing_javac() -> bool {
+    if command_available("javac") {
+        return false;
+    }
+    if std::env::var_os("FVM_AOT_REQUIRE_TOOLCHAIN").is_some_and(|value| value == "1") {
+        panic!("FVM_AOT_REQUIRE_TOOLCHAIN=1 but javac is missing");
+    }
+    println!("skipping fvm-aot CLI flow test because javac is missing");
+    true
+}
+
+/// Compiles a single Java class, panicking on failure. Callers must gate on
+/// [`skip_missing_javac`] first; once javac is known present, a compile failure
+/// is a real bug in the fixture, not a reason to silently pass the test
+/// (PUNCHLIST P0.4).
+fn compile_java_class(temp: &Path, class_name: &str, source: &str) -> PathBuf {
     let src_dir = temp.join("src");
     let classes_dir = temp.join("classes");
-    std::fs::create_dir_all(&src_dir).ok()?;
-    std::fs::create_dir_all(&classes_dir).ok()?;
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::create_dir_all(&classes_dir).unwrap();
     let source_path = src_dir.join(format!("{class_name}.java"));
-    std::fs::write(&source_path, source).ok()?;
+    std::fs::write(&source_path, source).unwrap();
     let status = Command::new("javac")
         .arg("--release")
         .arg("17")
@@ -201,11 +217,12 @@ fn compile_java_class(temp: &Path, class_name: &str, source: &str) -> Option<Pat
         .arg(&classes_dir)
         .arg(&source_path)
         .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    Some(classes_dir.join(format!("{class_name}.class")))
+        .expect("failed to execute javac");
+    assert!(
+        status.success(),
+        "javac failed to compile fixture {class_name}"
+    );
+    classes_dir.join(format!("{class_name}.class"))
 }
 
 fn write_test_jar(path: &Path, entries: &[&str], main_class: Option<&str>) {

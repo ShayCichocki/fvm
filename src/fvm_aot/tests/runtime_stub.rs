@@ -1,11 +1,10 @@
 use crate::fvm_aot::runtime_stub::{RuntimeHelperDeclaration, emit_runtime_stub_c};
-use crate::fvm_aot::test_support::command_available;
+use crate::fvm_aot::test_support::skip_or_require_toolchain;
 use std::process::Command;
 
 #[test]
 fn runtime_stub_compiles_when_cc_available() -> anyhow::Result<()> {
-    if !command_available("cc") {
-        println!("skipping runtime stub C compilation test because required tool is missing: cc");
+    if skip_or_require_toolchain(&["cc"]) {
         return Ok(());
     }
 

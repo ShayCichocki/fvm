@@ -1,6 +1,6 @@
 use crate::fvm_aot::test_support::{
-    AotFixture, ClassEntry, CompiledSources, JarSpec, JavaSource, NativeSpec, command_available,
-    run_hotspot, run_native,
+    AotFixture, ClassEntry, CompiledSources, JarSpec, JavaSource, NativeSpec, run_hotspot,
+    run_native,
 };
 
 struct StdoutFixture<'a> {
@@ -29,6 +29,31 @@ fn differential_println_matches_hotspot() {
 }
 "#,
         expected_stdout: b"hello fvm-aot\n",
+    });
+}
+
+// Exercises the Modified UTF-8 (CESU-8) constant-pool decoder (PUNCHLIST P0.2)
+// and the `String.contains("")` empty-needle case (PUNCHLIST P0.3). The
+// supplementary character 😀 (U+1F600) is stored in the class file as a CESU-8
+// surrogate pair; `length()` must be 2 UTF-16 units and `hashCode()` must fold
+// over both surrogate code units, matching HotSpot exactly.
+#[test]
+fn differential_unicode_and_contains_match_hotspot() {
+    if skip_missing_toolchain(&["javac", "java", "cc"]) {
+        return;
+    }
+
+    assert_aot_matches_hotspot(StdoutFixture {
+        main_class: "AotUnicode",
+        source: "public final class AotUnicode {\n\
+             \x20   public static void main(String[] args) {\n\
+             \x20       System.out.println(\"\u{1F600}\");\n\
+             \x20       System.out.println(\"a b\".length());\n\
+             \x20       System.out.println(\"\u{1F600}\".hashCode());\n\
+             \x20       System.out.println(\"x\".contains(\"\"));\n\
+             \x20   }\n\
+             }\n",
+        expected_stdout: "\u{1F600}\n3\n1772899\ntrue\n".as_bytes(),
     });
 }
 
@@ -91,9 +116,17 @@ fn assert_aot_matches_hotspot(fixture: StdoutFixture<'_>) {
         }])
         .unwrap();
 
+    // HotSpot is the source of truth: its stdout, stderr, and exit code are what
+    // the native binary must reproduce. `expected_stdout` is only a sanity
+    // anchor documenting intent — the real gate is native == hotspot.
     let hotspot = run_hotspot(&classes, fixture.main_class).unwrap();
-    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
-    assert_eq!(hotspot.stdout, fixture.expected_stdout);
+    assert_eq!(
+        hotspot.stdout,
+        fixture.expected_stdout,
+        "HotSpot stdout diverged from the fixture's documented expectation; \
+         stderr: {}",
+        String::from_utf8_lossy(&hotspot.stderr)
+    );
 
     let jar_name = format!("{}.jar", fixture.main_class);
     let jar = package_single_class(
@@ -114,9 +147,42 @@ fn assert_aot_matches_hotspot(fixture: StdoutFixture<'_>) {
         .unwrap();
 
     let native = run_native(&output).unwrap();
-    assert!(native.status.success(), "native binary failed: {native:?}");
-    assert_eq!(native.stdout, fixture.expected_stdout);
-    assert_eq!(native.stdout, hotspot.stdout);
+    assert_behavior_matches(&native, &hotspot);
+}
+
+/// Differential comparison against HotSpot across the full observable surface:
+/// stdout, stderr, and process exit code (PUNCHLIST P0.5). Comparing only
+/// stdout let stderr divergence and wrong exit codes pass silently.
+fn assert_behavior_matches(native: &std::process::Output, hotspot: &std::process::Output) {
+    let describe = |output: &std::process::Output| {
+        format!(
+            "exit={:?} stdout={:?} stderr={:?}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    };
+    assert_eq!(
+        native.stdout,
+        hotspot.stdout,
+        "stdout diverged\n native: {}\nhotspot: {}",
+        describe(native),
+        describe(hotspot)
+    );
+    assert_eq!(
+        native.stderr,
+        hotspot.stderr,
+        "stderr diverged\n native: {}\nhotspot: {}",
+        describe(native),
+        describe(hotspot)
+    );
+    assert_eq!(
+        native.status.code(),
+        hotspot.status.code(),
+        "exit code diverged\n native: {}\nhotspot: {}",
+        describe(native),
+        describe(hotspot)
+    );
 }
 
 fn package_single_class(
@@ -141,17 +207,5 @@ fn package_single_class(
 }
 
 fn skip_missing_toolchain(commands: &[&str]) -> bool {
-    let missing = commands
-        .iter()
-        .copied()
-        .filter(|command| !command_available(command))
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return false;
-    }
-    println!(
-        "skipping fvm-aot differential test because required tool(s) are missing: {}",
-        missing.join(", ")
-    );
-    true
+    crate::fvm_aot::test_support::skip_or_require_toolchain(commands)
 }

@@ -1,6 +1,6 @@
 use crate::fvm_aot::compiler::{CompilerPipeline, StaticIntMethodSpec};
 use crate::fvm_aot::test_support::{
-    AotFixture, ClassEntry, JarSpec, JavaSource, NativeSpec, command_available, run_hotspot,
+    AotFixture, ClassEntry, JarSpec, JavaSource, NativeSpec, run_hotspot,
 };
 use anyhow::Result;
 use std::process::Command;
@@ -253,9 +253,5 @@ fn compiler_pipeline_reports_unsupported_long_before_codegen() -> Result<()> {
 }
 
 fn skip_missing_toolchain() -> bool {
-    if command_available("javac") && command_available("java") && command_available("cc") {
-        return false;
-    }
-    println!("skipping fvm-aot compiler pipeline test because javac, java, or cc is missing");
-    true
+    crate::fvm_aot::test_support::skip_or_require_toolchain(&["javac", "java", "cc"])
 }

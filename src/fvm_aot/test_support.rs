@@ -154,10 +154,7 @@ impl AotFixture {
         Ok(output_path)
     }
 
-    pub(super) fn compile_native_compiler_required(
-        &self,
-        spec: NativeSpec<'_>,
-    ) -> Result<PathBuf> {
+    pub(super) fn compile_native_compiler_required(&self, spec: NativeSpec<'_>) -> Result<PathBuf> {
         let output_path = self.path().join(spec.output_name);
         super::compile_jar_compiler_required(&CompileSpec {
             jar_path: spec.jar_path,
@@ -219,6 +216,43 @@ fn keep_failed_aot_artifacts() -> bool {
 
 pub(super) fn command_available(name: &str) -> bool {
     Command::new(name).arg("--version").output().is_ok()
+}
+
+const REQUIRE_TOOLCHAIN_ENV: &str = "FVM_AOT_REQUIRE_TOOLCHAIN";
+
+/// Returns `true` when a test should skip because a required host tool is
+/// missing, and `false` when every tool is present.
+///
+/// When `FVM_AOT_REQUIRE_TOOLCHAIN=1` (set in CI), a missing tool is a hard
+/// failure instead of a silent skip — otherwise a broken toolchain would let
+/// whole swaths of coverage silently evaporate while CI still reports green
+/// (PUNCHLIST P0.4). Every `skip_missing_toolchain` helper delegates here so a
+/// single env var governs skip-vs-fail everywhere.
+pub(super) fn skip_or_require_toolchain(commands: &[&str]) -> bool {
+    let missing = commands
+        .iter()
+        .copied()
+        .filter(|command| !command_available(command))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return false;
+    }
+    if toolchain_required() {
+        panic!(
+            "{REQUIRE_TOOLCHAIN_ENV}=1 but required tool(s) are missing: {}",
+            missing.join(", ")
+        );
+    }
+    println!(
+        "skipping fvm-aot test because required tool(s) are missing: {}",
+        missing.join(", ")
+    );
+    true
+}
+
+/// Whether the current run demands a full toolchain (CI sets this so skips fail).
+pub(super) fn toolchain_required() -> bool {
+    std::env::var_os(REQUIRE_TOOLCHAIN_ENV).is_some_and(|value| value == "1")
 }
 
 pub(super) fn run_hotspot(classes: &CompiledSources, main_class: &str) -> Result<Output> {

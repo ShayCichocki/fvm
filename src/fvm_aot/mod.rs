@@ -77,6 +77,28 @@ pub fn compile_jar(spec: &CompileSpec) -> Result<()> {
     Ok(())
 }
 
+/// Compile a JAR strictly through the IR → Cranelift compiler path, with the
+/// build-time evaluator fallback disabled. Unsupported constructs fail loudly
+/// with milestone-tagged diagnostics instead of being constant-folded. Used by
+/// the M1 "compiler-required" tests to prove real compilation vs. build-time
+/// evaluation.
+#[cfg(test)]
+fn compile_jar_compiler_required(spec: &CompileSpec) -> Result<()> {
+    let main_class = spec
+        .main_class
+        .as_deref()
+        .context("fvm-aot requires a Main-Class manifest entry or --main-class")?;
+    let world = read_class_world(&spec.jar_path)?;
+    compiler::CompilerPipeline::from_world(world, main_class)
+        .compile_entry(&spec.cc, &spec.output_path, spec.dry_run)
+        .context(
+            "fvm-aot compiler-required path rejected the program; \
+             no build-time evaluator fallback is available on this path",
+        )?;
+    make_executable(&spec.output_path)?;
+    Ok(())
+}
+
 fn read_class_world(jar_path: &Path) -> Result<ClassWorld> {
     let file = std::fs::File::open(jar_path)
         .with_context(|| format!("failed to open JAR {}", jar_path.display()))?;

@@ -39,6 +39,45 @@ impl NativeStaticIntMethod {
 }
 
 impl CompilerPipeline {
+    /// Compile the program's `main` entry through the IR → Cranelift path only.
+    ///
+    /// This is the "compiler-required" seam: there is no build-time evaluator
+    /// fallback here. Any construct the compiler cannot yet express surfaces as
+    /// a loud, milestone-tagged lowering diagnostic rather than being silently
+    /// constant-folded. Phase 1+ grows what this path accepts.
+    pub(in crate::fvm_aot) fn compile_entry(
+        &self,
+        cc: &str,
+        output_path: &Path,
+        dry_run: bool,
+    ) -> Result<()> {
+        let entry = MethodKey::new(&self.main_class, "main", "([Ljava/lang/String;)V");
+        let lowered = self.lower_static_int_closure(entry)?;
+
+        if dry_run {
+            std::fs::write(output_path, "dry-run fvm-aot compiler-path placeholder\n")
+                .with_context(|| {
+                    format!(
+                        "failed to write compiler-path dry-run placeholder {}",
+                        output_path.display()
+                    )
+                })?;
+            return Ok(());
+        }
+
+        let functions = lowered.iter().collect::<Vec<_>>();
+        let object = emit_objects(&functions)?;
+        let entry_name = format!("{}.main", self.main_class.replace('/', "."));
+        let entry_symbol = exported_symbol(&entry_name);
+        link_cranelift_object_with_runtime_stub(&LinkSpec {
+            cc,
+            object_bytes: &object,
+            entry_symbol: &entry_symbol,
+            output_path,
+        })?;
+        Ok(())
+    }
+
     pub(in crate::fvm_aot) fn compile_static_int_method(
         &self,
         spec: &StaticIntMethodSpec<'_>,

@@ -593,17 +593,5 @@ public final class AotCoreMethods {
 }
 
 fn skip_missing_toolchain(commands: &[&str]) -> bool {
-    let missing = commands
-        .iter()
-        .copied()
-        .filter(|command| !command_available(command))
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return false;
-    }
-    println!(
-        "skipping fvm-aot current_slice test because required tool(s) are missing: {}",
-        missing.join(", ")
-    );
-    true
+    crate::fvm_aot::test_support::skip_or_require_toolchain(commands)
 }
