@@ -8,6 +8,7 @@ mod emitter;
 mod evaluator;
 mod ir;
 mod ir_verify;
+mod link;
 #[cfg(test)]
 mod lower;
 mod reachability;
@@ -140,6 +141,7 @@ mod tests {
     mod failure_artifacts;
     mod ir;
     mod ir_verify;
+    mod link;
     mod lower;
     mod reachability;
     mod runtime_stub;
