@@ -11,6 +11,7 @@ mod ir_verify;
 #[cfg(test)]
 mod lower;
 mod reachability;
+mod runtime_stub;
 #[cfg(test)]
 mod test_support;
 mod types;
@@ -141,6 +142,7 @@ mod tests {
     mod ir_verify;
     mod lower;
     mod reachability;
+    mod runtime_stub;
     mod unsupported;
 
     #[test]
