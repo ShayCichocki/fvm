@@ -96,6 +96,30 @@ fn ir_verify_rejects_return_type_mismatch_with_descriptor() {
 }
 
 #[test]
+fn ir_verify_rejects_descriptor_model_return_mismatch() {
+    let function = FunctionIr {
+        name: "Verifier.descriptorMismatch".to_string(),
+        descriptor: "()I".to_string(),
+        params: Vec::new(),
+        return_type: IrType::Void,
+        blocks: vec![BasicBlockIr {
+            id: BasicBlockId::new(0),
+            instrs: vec![IrInstr::Return(None)],
+        }],
+    };
+
+    assert_error_contains(
+        &function,
+        &[
+            "Verifier.descriptorMismatch()I",
+            "descriptor return type mismatch",
+            "descriptor int",
+            "modeled void",
+        ],
+    );
+}
+
+#[test]
 fn ir_verify_rejects_unsupported_type() {
     let function = FunctionIr {
         name: "Verifier.unsupported".to_string(),

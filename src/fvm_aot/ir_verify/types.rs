@@ -44,6 +44,21 @@ pub(super) fn return_compatible(expected: &IrType, actual: &IrType) -> bool {
     }
 }
 
+pub(super) fn verify_descriptor_model_return(
+    label: &str,
+    descriptor: &str,
+    modeled: &IrType,
+) -> Result<()> {
+    let descriptor_return = descriptor_return_type(descriptor)?;
+    verify_supported_type(label, "descriptor return type", &descriptor_return)?;
+    if return_compatible(&descriptor_return, modeled) {
+        return Ok(());
+    }
+    bail!(
+        "IR function `{label}` descriptor return type mismatch: descriptor {descriptor_return}, modeled {modeled}"
+    )
+}
+
 pub(super) fn verify_supported_type(label: &str, role: &str, ty: &IrType) -> Result<()> {
     match ty {
         IrType::Void | IrType::Int | IrType::Boolean | IrType::Char | IrType::Object(_) => Ok(()),

@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use std::collections::HashSet;
 use types::{
     constant_type, descriptor_return_type, return_compatible, runtime_return_type,
-    verify_supported_trap, verify_supported_type,
+    verify_descriptor_model_return, verify_supported_trap, verify_supported_type,
 };
 use values::ValueTypes;
 
@@ -45,6 +45,11 @@ impl<'a> Verifier<'a> {
     fn verify(mut self) -> Result<()> {
         self.seed_params()?;
         self.verify_type("return type", &self.function.return_type)?;
+        verify_descriptor_model_return(
+            &self.label(),
+            &self.function.descriptor,
+            &self.function.return_type,
+        )?;
         for block in &self.function.blocks {
             for instr in &block.instrs {
                 self.verify_instr(block.id, instr)?;
