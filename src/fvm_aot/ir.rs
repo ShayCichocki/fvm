@@ -1,14 +1,15 @@
 #![allow(dead_code)]
 
-// allow: SIZE_OK - single runtime compiler IR model; T17 owns verifier extraction.
+// allow: SIZE_OK - single runtime compiler IR model; verifier lives in ir_verify.rs.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 mod display;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FunctionIr {
     pub(super) name: String,
+    pub(super) descriptor: String,
     pub(super) params: Vec<IrParam>,
     pub(super) return_type: IrType,
     pub(super) blocks: Vec<BasicBlockIr>,
@@ -20,56 +21,7 @@ impl FunctionIr {
     }
 
     pub(super) fn verify(&self) -> Result<()> {
-        let block_ids = self.blocks.iter().map(|block| block.id).collect::<Vec<_>>();
-        for block in &self.blocks {
-            for instr in &block.instrs {
-                match instr {
-                    IrInstr::Branch(target) => self.verify_target(block.id, *target, &block_ids)?,
-                    IrInstr::CondBranch(_, then_target, else_target) => {
-                        self.verify_target(block.id, *then_target, &block_ids)?;
-                        self.verify_target(block.id, *else_target, &block_ids)?;
-                    }
-                    IrInstr::ExceptionEdge(_, target) => {
-                        self.verify_target(block.id, *target, &block_ids)?;
-                    }
-                    IrInstr::Param(..)
-                    | IrInstr::Constant(..)
-                    | IrInstr::Compare(..)
-                    | IrInstr::Arithmetic(..)
-                    | IrInstr::Unary(..)
-                    | IrInstr::Call(..)
-                    | IrInstr::RuntimeCall(..)
-                    | IrInstr::Return(..)
-                    | IrInstr::FieldGet(..)
-                    | IrInstr::FieldPut(..)
-                    | IrInstr::ArrayLoad(..)
-                    | IrInstr::ArrayStore(..)
-                    | IrInstr::ArrayLength(..)
-                    | IrInstr::NewObject(..)
-                    | IrInstr::NewArray(..)
-                    | IrInstr::ZeroCheck(..)
-                    | IrInstr::NullCheck(..)
-                    | IrInstr::BoundsCheck(..)
-                    | IrInstr::Trap(..) => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn verify_target(
-        &self,
-        source: BasicBlockId,
-        target: BasicBlockId,
-        block_ids: &[BasicBlockId],
-    ) -> Result<()> {
-        if block_ids.contains(&target) {
-            return Ok(());
-        }
-        bail!(
-            "IR function `{}` branches from {source} to missing target {target}",
-            self.name
-        );
+        super::ir_verify::verify_function(self)
     }
 }
 

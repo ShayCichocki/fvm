@@ -4,6 +4,7 @@ mod diagnostics;
 mod emitter;
 mod evaluator;
 mod ir;
+mod ir_verify;
 #[cfg(test)]
 mod lower;
 mod reachability;
@@ -132,6 +133,7 @@ mod tests {
     mod differential;
     mod failure_artifacts;
     mod ir;
+    mod ir_verify;
     mod lower;
     mod reachability;
     mod unsupported;

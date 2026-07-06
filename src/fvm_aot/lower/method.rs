@@ -104,6 +104,7 @@ impl<'a> MethodLowerer<'a> {
 
         let ir = FunctionIr {
             name: ir_name(self.class_file, self.method),
+            descriptor: self.method.descriptor.clone(),
             params,
             return_type,
             blocks,
