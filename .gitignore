@@ -10,3 +10,4 @@ examples/perf-http/build/
 examples/perf-http/perf-app.jar
 examples/perf-http/*.fvm/
 perf-results/
+.omo/
