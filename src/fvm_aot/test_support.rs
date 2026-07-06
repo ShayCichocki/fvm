@@ -154,6 +154,21 @@ impl AotFixture {
         Ok(output_path)
     }
 
+    pub(super) fn compile_native_compiler_required(
+        &self,
+        spec: NativeSpec<'_>,
+    ) -> Result<PathBuf> {
+        let output_path = self.path().join(spec.output_name);
+        super::compile_jar_compiler_required(&CompileSpec {
+            jar_path: spec.jar_path,
+            main_class: Some(spec.main_class.to_string()),
+            output_path: output_path.clone(),
+            cc: "cc".to_string(),
+            dry_run: spec.dry_run,
+        })?;
+        Ok(output_path)
+    }
+
     pub(super) fn preserve_failed_artifacts(&mut self, reason: &str) -> FailedAotArtifacts {
         if keep_failed_aot_artifacts() {
             let retained_dir = self.keep_artifacts();

@@ -143,6 +143,7 @@ mod tests {
     mod ir_verify;
     mod link;
     mod lower;
+    mod m1_compiler_path;
     mod reachability;
     mod runtime_stub;
     mod unsupported;
