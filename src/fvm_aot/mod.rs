@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
 mod classfile;
+#[cfg(test)]
+mod compiler;
 mod diagnostics;
 mod emitter;
 mod evaluator;
@@ -129,6 +131,7 @@ fn make_executable(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    mod compiler_pipeline;
     mod current_slice;
     mod differential;
     mod failure_artifacts;

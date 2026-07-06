@@ -1,5 +1,6 @@
 use super::super::ir::{
-    IrArithmeticOp, IrCompareOp, IrConst, IrInstr, IrType, IrUnaryOp, TrapReason, ValueId,
+    IrArithmeticOp, IrCompareOp, IrConst, IrInstr, IrType, IrUnaryOp, MethodRef, TrapReason,
+    ValueId,
 };
 use anyhow::{Context, Result};
 
@@ -132,6 +133,22 @@ impl LowerState {
         let value = self.new_value();
         self.instrs.push(IrInstr::Compare(value, op, lhs, rhs));
         value
+    }
+
+    pub(super) fn push_static_call(
+        &mut self,
+        method: MethodRef,
+        args: Vec<ValueId>,
+        return_type: IrType,
+    ) {
+        match return_type {
+            IrType::Void => self.instrs.push(IrInstr::Call(None, method, args)),
+            _ => {
+                let value = self.new_value();
+                self.instrs.push(IrInstr::Call(Some(value), method, args));
+                self.stack.push(value);
+            }
+        }
     }
 
     fn load_local(&self, index: u16) -> Result<ValueId> {

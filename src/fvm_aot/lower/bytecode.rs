@@ -193,6 +193,7 @@ fn decode_instruction(code: &[u8], bci: usize) -> Result<DecodedInstruction> {
         | 0x2a..=0x2d
         | 0x3b..=0x3e
         | 0x4b..=0x4e
+        | 0x57
         | 0x60
         | 0x64
         | 0x68
@@ -224,6 +225,10 @@ fn decode_instruction(code: &[u8], bci: usize) -> Result<DecodedInstruction> {
             ControlFlow::Goto {
                 target: branch_target(bci, offset, code.len())?,
             }
+        }
+        0xb8 => {
+            let _ = read_u16(code, &mut pc)?;
+            ControlFlow::Normal
         }
         0xac | 0xb0 | 0xb1 => ControlFlow::Return,
         other => bail!("{}", unsupported_opcode_message(other)),

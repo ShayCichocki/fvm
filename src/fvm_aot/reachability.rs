@@ -17,6 +17,12 @@ pub(super) struct ReachabilityGraph {
 }
 
 impl ReachabilityGraph {
+    pub(super) fn methods(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.methods
+            .iter()
+            .map(|method| (method.0.as_str(), method.1.as_str(), method.2.as_str()))
+    }
+
     pub(super) fn render_text(&self) -> String {
         let mut text = String::new();
         text.push_str("classes:\n");

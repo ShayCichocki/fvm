@@ -2,10 +2,9 @@ use super::super::classfile::{ClassFile, Code, Method};
 use super::super::diagnostics::unsupported_opcode_message;
 use super::super::ir::{BasicBlockIr, FunctionIr, IrArithmeticOp, IrConst, IrInstr, IrParam};
 use super::super::types::{JvmType, parse_method_descriptor};
-use super::bytecode::{
-    BlockPlan, BranchOperands, branch_operands, branch_target, plan_blocks, read_i16, read_u8,
-    read_u16,
-};
+use super::branches::{BranchLowering, lower_conditional_branch, lower_goto};
+use super::bytecode::{BlockPlan, plan_blocks, read_i16, read_u8, read_u16};
+use super::calls::{CallLowering, lower_invokestatic, push_int_constant};
 use super::metadata::{ir_name, ir_type_for_jvm, method_label};
 use super::state::{FrameSnapshot, LowerState};
 use anyhow::{Context, Result, bail};
@@ -154,7 +153,7 @@ impl<'a> MethodLowerer<'a> {
                 } else {
                     read_u16(&self.code.bytes, &mut self.pc)?
                 };
-                self.push_int_constant(index)?;
+                push_int_constant(&mut self.call_lowering(), index)?;
             }
             0x15 | 0x19 | 0x1a..=0x1d | 0x2a..=0x2d => {
                 let index = match opcode {
@@ -174,6 +173,9 @@ impl<'a> MethodLowerer<'a> {
                 };
                 self.state.store_popped_local(index)?;
             }
+            0x57 => {
+                let _ = self.state.pop_stack()?;
+            }
             0x60 => self.state.push_binary(IrArithmeticOp::Add)?,
             0x64 => self.state.push_binary(IrArithmeticOp::Sub)?,
             0x68 => self.state.push_binary(IrArithmeticOp::Mul)?,
@@ -188,8 +190,11 @@ impl<'a> MethodLowerer<'a> {
                 )?]));
                 self.state.increment_local(index, delta)?;
             }
-            0x99..=0xa6 | 0xc6 | 0xc7 => return self.lower_conditional_branch(opcode, opcode_pc),
-            0xa7 => return self.lower_goto(opcode_pc),
+            0x99..=0xa6 | 0xc6 | 0xc7 => {
+                return lower_conditional_branch(&mut self.branch_lowering(), opcode, opcode_pc);
+            }
+            0xa7 => return lower_goto(&mut self.branch_lowering(), opcode_pc),
+            0xb8 => lower_invokestatic(&mut self.call_lowering())?,
             0xac | 0xb0 | 0xb1 => {
                 let value = if opcode == 0xb1 {
                     None
@@ -204,45 +209,6 @@ impl<'a> MethodLowerer<'a> {
         Ok(false)
     }
 
-    fn lower_conditional_branch(&mut self, opcode: u8, opcode_pc: usize) -> Result<bool> {
-        let offset = read_i16(&self.code.bytes, &mut self.pc)?;
-        let target_bci = branch_target(opcode_pc, offset, self.code.bytes.len())?;
-        let target = self.plan.block_id_for_bci(target_bci)?;
-        let fallthrough = self.plan.block_id_for_bci(self.pc)?;
-        let operands = branch_operands(opcode)
-            .with_context(|| format!("branch opcode 0x{opcode:02x} had no operand model"))?;
-        let condition = match operands {
-            BranchOperands::IntZero(op) => {
-                let lhs = self.state.pop_stack()?;
-                let rhs = self.state.emit_constant(IrConst::Int(0));
-                self.state.push_compare(op, lhs, Some(rhs))
-            }
-            BranchOperands::IntPair(op) | BranchOperands::RefPair(op) => {
-                let rhs = self.state.pop_stack()?;
-                let lhs = self.state.pop_stack()?;
-                self.state.push_compare(op, lhs, Some(rhs))
-            }
-            BranchOperands::RefNull(op) => {
-                let lhs = self.state.pop_stack()?;
-                self.state.push_compare(op, lhs, None)
-            }
-        };
-        self.record_entry_state(target_bci);
-        self.record_entry_state(self.pc);
-        self.state
-            .emit(IrInstr::CondBranch(condition, target, fallthrough));
-        Ok(true)
-    }
-
-    fn lower_goto(&mut self, opcode_pc: usize) -> Result<bool> {
-        let offset = read_i16(&self.code.bytes, &mut self.pc)?;
-        let target_bci = branch_target(opcode_pc, offset, self.code.bytes.len())?;
-        let target = self.plan.block_id_for_bci(target_bci)?;
-        self.record_entry_state(target_bci);
-        self.state.emit(IrInstr::Branch(target));
-        Ok(true)
-    }
-
     fn record_entry_state(&mut self, bci: usize) {
         if self.entry_states.contains_key(&bci) {
             return;
@@ -250,11 +216,23 @@ impl<'a> MethodLowerer<'a> {
         self.entry_states.insert(bci, self.state.snapshot());
     }
 
-    fn push_int_constant(&mut self, index: u16) -> Result<()> {
-        let value = self.class_file.int_constant(index).with_context(|| {
-            format!("fvm-aot lowerer only supports integer ldc constants at index {index}")
-        })?;
-        let _ = self.state.push_constant(IrConst::Int(value));
-        Ok(())
+    fn call_lowering(&mut self) -> CallLowering<'_, '_> {
+        CallLowering {
+            class_file: self.class_file,
+            code: self.code,
+            pc: &mut self.pc,
+            method_label: &self.method_label,
+            state: &mut self.state,
+        }
+    }
+
+    fn branch_lowering(&mut self) -> BranchLowering<'_, '_> {
+        BranchLowering {
+            code: self.code,
+            plan: &self.plan,
+            pc: &mut self.pc,
+            state: &mut self.state,
+            entry_states: &mut self.entry_states,
+        }
     }
 }
