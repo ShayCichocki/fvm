@@ -2,7 +2,9 @@ use crate::fvm_aot::codegen::cranelift::emit_object;
 use crate::fvm_aot::ir::{
     BasicBlockId, BasicBlockIr, FunctionIr, IrConst, IrInstr, IrType, ValueId,
 };
-use crate::fvm_aot::link::{LinkSpec, link_cranelift_object_with_runtime_stub as link_object};
+use crate::fvm_aot::link::{
+    EntryReturn, LinkSpec, link_cranelift_object_with_runtime_stub as link_object,
+};
 use crate::fvm_aot::test_support::command_available;
 use std::process::Command;
 
@@ -20,7 +22,8 @@ fn link_cranelift_object_with_runtime_stub_runs_native_executable() -> anyhow::R
     let linked = link_object(&LinkSpec {
         cc: "cc",
         object_bytes: &object,
-        entry_symbol: "fvm_aot_main",
+        entry_symbol: "fvm_aot_main_28_29I",
+        entry_return: EntryReturn::Int,
         output_path: &executable_path,
     })?;
 
@@ -46,7 +49,8 @@ fn link_reports_missing_configured_cc() -> anyhow::Result<()> {
     let message = link_object(&LinkSpec {
         cc: missing_cc,
         object_bytes: &object,
-        entry_symbol: "fvm_aot_main",
+        entry_symbol: "fvm_aot_main_28_29I",
+        entry_return: EntryReturn::Int,
         output_path: &executable_path,
     })
     .unwrap_err()
@@ -65,6 +69,7 @@ fn int_returning_main() -> FunctionIr {
         return_type: IrType::Int,
         blocks: vec![BasicBlockIr {
             id: BasicBlockId::new(0),
+            params: Vec::new(),
             instrs: vec![
                 IrInstr::Constant(ValueId::new(0), IrConst::Int(0)),
                 IrInstr::Return(Some(ValueId::new(0))),

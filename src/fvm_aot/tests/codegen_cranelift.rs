@@ -22,18 +22,37 @@ fn cranelift_emits_constant_return_object() -> anyhow::Result<()> {
         .filter_map(|symbol| symbol.name().ok().map(str::to_string))
         .collect::<Vec<_>>();
 
+    // The descriptor `()I` is hex-escaped into the symbol so overloads stay
+    // distinct: `(` -> _28, `)` -> _29.
     assert!(
         symbols
             .iter()
             .any(|symbol| symbol.strip_prefix('_').unwrap_or(symbol)
-                == "fvm_aot_Codegen_constantReturn"),
-        "expected exported symbol fvm_aot_Codegen_constantReturn in object symbols {symbols:?}"
+                == "fvm_aot_Codegen_constantReturn_28_29I"),
+        "expected exported symbol fvm_aot_Codegen_constantReturn_28_29I in object symbols {symbols:?}"
     );
     Ok(())
 }
 
 #[test]
+fn exported_symbol_distinguishes_overloads_by_descriptor() {
+    use crate::fvm_aot::codegen::cranelift::exported_symbol;
+
+    // Same class and method name, different parameter types: the old
+    // name-only mangling collapsed these into one symbol.
+    let take_int = exported_symbol("Overload.f", "(I)I");
+    let take_two = exported_symbol("Overload.f", "(II)I");
+    let take_string = exported_symbol("Overload.f", "(Ljava/lang/String;)I");
+
+    assert_ne!(take_int, take_two);
+    assert_ne!(take_int, take_string);
+    assert_ne!(take_two, take_string);
+}
+
+#[test]
 fn cranelift_rejects_unsupported_instruction() {
+    // `emit_object` uses an empty object model, so allocating a class it has no
+    // layout for is rejected loudly (rather than emitting a bad allocation).
     let function = int_function(
         "Codegen.unsupportedAllocation",
         vec![
@@ -49,7 +68,7 @@ fn cranelift_rejects_unsupported_instruction() {
     assert!(message.contains("unsupported-codegen"));
     assert!(message.contains("Codegen.unsupportedAllocation()I"));
     assert!(message.contains("instruction=NewObject"));
-    assert!(message.contains("runtime-allocation"));
+    assert!(message.contains("no object layout for class CodegenObject"));
 }
 
 fn int_function(name: &str, instrs: Vec<IrInstr>) -> FunctionIr {
@@ -60,6 +79,7 @@ fn int_function(name: &str, instrs: Vec<IrInstr>) -> FunctionIr {
         return_type: IrType::Int,
         blocks: vec![BasicBlockIr {
             id: BasicBlockId::new(0),
+            params: Vec::new(),
             instrs,
         }],
     }

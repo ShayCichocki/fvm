@@ -153,15 +153,22 @@ fn lower_branches_to_blocks() -> Result<()> {
         block_headers,
         [
             "bb0 -> [bb1]:",
-            "bb1 -> [bb6, bb2]:",
-            "bb2 -> [bb4, bb3]:",
-            "bb3 -> [bb5]:",
-            "bb4 -> [bb5]:",
-            "bb5 -> [bb1]:",
-            "bb6 -> []:",
+            "bb1(v3: int, v4: int, v5: int) -> [bb6, bb2]:",
+            "bb2(v10: int, v11: int, v12: int) -> [bb4, bb3]:",
+            "bb3(v18: int, v19: int, v20: int) -> [bb5]:",
+            "bb4(v15: int, v16: int, v17: int) -> [bb5]:",
+            "bb5(v22: int, v23: int, v24: int) -> [bb1]:",
+            "bb6(v7: int, v8: int, v9: int) -> []:",
         ]
     );
-    for expected in ["branch_if", "cmp_int_ge", "branch bb1", "return"] {
+    // The loop's back-edge must thread the *updated* loop-carried values as
+    // block arguments (the phi), not silently reuse the first predecessor's.
+    for expected in [
+        "branch_if",
+        "cmp_int_ge",
+        "branch bb1(v22, v23, v28)",
+        "return",
+    ] {
         assert!(
             text.contains(expected),
             "missing `{expected}` in IR:\n{text}"
@@ -178,6 +185,75 @@ fn lower_branches_to_blocks() -> Result<()> {
         "missing reference branch placeholder in IR:\n{ref_text}"
     );
     ref_ir.verify()?;
+
+    Ok(())
+}
+
+#[test]
+fn lower_diamond_merge_threads_both_predecessor_values() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotMerge.java",
+        contents: r#"public final class AotMerge {
+    static int pick(int c, int a, int b) {
+        int r;
+        if (c != 0) {
+            r = a;
+        } else {
+            r = b;
+        }
+        return r + 1;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(pick(1, 7, 9));
+        System.out.println(pick(0, 7, 9));
+    }
+}
+"#,
+    }])?;
+    let hotspot = run_hotspot(&classes, "AotMerge")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    assert_eq!(String::from_utf8_lossy(&hotspot.stdout), "8\n10\n");
+
+    let class_file = parse_class(&classes.class_path("AotMerge.class"))?;
+    let method = find_method(&class_file, "pick", "(III)I")?;
+    let ir = lower_method_to_ir(&class_file, method)?;
+    let text = ir.render_text();
+    println!("{text}");
+    ir.verify()?;
+
+    // The merge block reached from both arms of the `if` must receive `r` as a
+    // block parameter, and each predecessor edge must pass its own value for it.
+    // First-writer-wins snapshots silently dropped one arm; block parameters do
+    // not.
+    let merge_header = text
+        .lines()
+        .find(|line| line.starts_with("bb3("))
+        .expect("merge block bb3 should declare parameters");
+    assert_eq!(
+        merge_header.matches(": int").count(),
+        4,
+        "merge block should carry all four live locals as params:\n{text}"
+    );
+    let edges = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("branch bb3"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edges.len(),
+        2,
+        "merge block bb3 should have two edges:\n{text}"
+    );
+    assert_ne!(
+        edges[0], edges[1],
+        "each predecessor must thread its own value for r:\n{text}"
+    );
 
     Ok(())
 }
@@ -230,6 +306,51 @@ fn lower_rejects_branch_target_out_of_range() -> Result<()> {
         assert!(
             text.contains(expected),
             "branch error did not contain `{expected}`:\n{text}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn lower_rejects_exception_table_pointing_at_phase_five() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotLowerTryCatch.java",
+        contents: r#"public final class AotLowerTryCatch {
+    static int guarded(int value) {
+        try {
+            return 100 / value;
+        } catch (ArithmeticException e) {
+            return -1;
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(guarded(0));
+    }
+}
+"#,
+    }])?;
+    let class_file = parse_class(&classes.class_path("AotLowerTryCatch.class"))?;
+    let method = find_method(&class_file, "guarded", "(I)I")?;
+    let err = match lower_method_to_ir(&class_file, method) {
+        Ok(ir) => anyhow::bail!("try/catch lowered unexpectedly:\n{}", ir.render_text()),
+        Err(err) => err,
+    };
+    let text = format!("{err:#}");
+    for expected in [
+        "AotLowerTryCatch.guarded(I)I",
+        "exception handlers",
+        "Phase 5",
+    ] {
+        assert!(
+            text.contains(expected),
+            "exception-table error did not contain `{expected}`:\n{text}"
         );
     }
 

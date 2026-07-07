@@ -1,4 +1,4 @@
-use crate::fvm_aot::ir::{BasicBlockId, BasicBlockIr, FunctionIr, IrInstr, IrType};
+use crate::fvm_aot::ir::{BasicBlockId, BasicBlockIr, BranchEdge, FunctionIr, IrInstr, IrType};
 
 #[test]
 fn ir_empty_main_snapshot() {
@@ -9,6 +9,7 @@ fn ir_empty_main_snapshot() {
         return_type: IrType::Void,
         blocks: vec![BasicBlockIr {
             id: BasicBlockId::new(0),
+            params: Vec::new(),
             instrs: vec![IrInstr::Return(None)],
         }],
     };
@@ -29,7 +30,8 @@ fn ir_rejects_invalid_branch_target() {
         return_type: IrType::Void,
         blocks: vec![BasicBlockIr {
             id: BasicBlockId::new(0),
-            instrs: vec![IrInstr::Branch(BasicBlockId::new(9))],
+            params: Vec::new(),
+            instrs: vec![IrInstr::Branch(BranchEdge::to(BasicBlockId::new(9)))],
         }],
     };
 

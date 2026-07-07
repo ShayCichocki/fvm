@@ -9,6 +9,7 @@ pub(super) fn instruction_category(instr: &IrInstr) -> &'static str {
         IrInstr::Unary(..) => "Unary",
         IrInstr::Branch(..) => "Branch",
         IrInstr::CondBranch(..) => "CondBranch",
+        IrInstr::Switch(..) => "Switch",
         IrInstr::Call(..) => "Call",
         IrInstr::RuntimeCall(..) => "RuntimeCall",
         IrInstr::Return(..) => "Return",

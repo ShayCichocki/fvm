@@ -1,8 +1,11 @@
 use super::{CompilerPipeline, method_label};
 use crate::fvm_aot::codegen::cranelift::{emit_objects, exported_symbol};
 use crate::fvm_aot::ir::{FunctionIr, IrInstr, IrType, MethodRef};
-use crate::fvm_aot::link::{LinkSpec, LinkedExecutable, link_cranelift_object_with_runtime_stub};
+use crate::fvm_aot::link::{
+    EntryReturn, LinkSpec, LinkedExecutable, link_cranelift_object_with_runtime_stub,
+};
 use crate::fvm_aot::lower::lower_method_to_ir;
+use crate::fvm_aot::object_model::ObjectModel;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -66,13 +69,15 @@ impl CompilerPipeline {
         }
 
         let functions = lowered.iter().collect::<Vec<_>>();
-        let object = emit_objects(&functions)?;
+        let model = ObjectModel::from_classes(&self.world.classes)?;
+        let object = emit_objects(&functions, &model)?;
         let entry_name = format!("{}.main", self.main_class.replace('/', "."));
-        let entry_symbol = exported_symbol(&entry_name);
+        let entry_symbol = exported_symbol(&entry_name, "([Ljava/lang/String;)V");
         link_cranelift_object_with_runtime_stub(&LinkSpec {
             cc,
             object_bytes: &object,
             entry_symbol: &entry_symbol,
+            entry_return: EntryReturn::Void,
             output_path,
         })?;
         Ok(())
@@ -85,13 +90,15 @@ impl CompilerPipeline {
         let entry = MethodKey::new(&spec.class.replace('.', "/"), spec.name, spec.descriptor);
         let lowered = self.lower_static_int_closure(entry)?;
         let functions = lowered.iter().collect::<Vec<_>>();
-        let object = emit_objects(&functions)?;
+        let model = ObjectModel::from_classes(&self.world.classes)?;
+        let object = emit_objects(&functions, &model)?;
         let entry_name = format!("{}.{}", spec.class.replace('/', "."), spec.name);
-        let entry_symbol = exported_symbol(&entry_name);
+        let entry_symbol = exported_symbol(&entry_name, spec.descriptor);
         let linked = link_cranelift_object_with_runtime_stub(&LinkSpec {
             cc: spec.cc,
             object_bytes: &object,
             entry_symbol: &entry_symbol,
+            entry_return: entry_return_for_descriptor(spec.descriptor)?,
             output_path: spec.output_path,
         })?;
 
@@ -114,7 +121,12 @@ impl CompilerPipeline {
                 })?;
             let ir = lower_method_to_ir(class_file, method)
                 .with_context(|| format!("phase=lower method={}", method_key.label()))?;
-            require_static_int_method(&ir)?;
+            // The compiled entry's result is delivered via the int print ABI, so
+            // it must return int; helper methods reached transitively (void
+            // constructors, reference-returning helpers) are unconstrained.
+            if lowered.is_empty() {
+                require_int_return_method(&ir)?;
+            }
             for call in direct_static_calls(&ir) {
                 if self.world.classes.contains_key(&call.class) {
                     queue.push_back(MethodKey::new(&call.class, &call.name, &call.descriptor));
@@ -156,19 +168,39 @@ impl MethodKey {
     }
 }
 
-fn require_static_int_method(function: &FunctionIr) -> Result<()> {
-    match (&function.return_type, function.blocks.as_slice()) {
-        (IrType::Int, [_]) => Ok(()),
-        (IrType::Void, _)
-        | (IrType::Boolean, _)
-        | (IrType::Char, _)
-        | (IrType::Object(_), _)
-        | (IrType::Array(_), _)
-        | (IrType::Unsupported(_), _)
-        | (IrType::Int, [])
-        | (IrType::Int, [_, _, ..]) => bail!(
-            "phase=compiler method={} message=T23 supports single-block static int methods only",
+/// The Cranelift path lowers int-returning static methods; control flow
+/// (multiple blocks, loops, branches) is supported as of P1.3. Non-int return
+/// types still await later phases (object/void/long ABIs), so they are rejected
+/// loudly here rather than reaching codegen.
+fn require_int_return_method(function: &FunctionIr) -> Result<()> {
+    match &function.return_type {
+        IrType::Int if !function.blocks.is_empty() => Ok(()),
+        IrType::Int
+        | IrType::Void
+        | IrType::Boolean
+        | IrType::Char
+        | IrType::Object(_)
+        | IrType::Array(_)
+        | IrType::Unsupported(_) => bail!(
+            "phase=compiler method={} message=compiler path supports int-returning static methods only",
             function.name
+        ),
+    }
+}
+
+/// Map a compiled entry method's descriptor return type to how its result is
+/// delivered. The closure only admits int-returning methods (plus the void
+/// `main`), so those are the two cases; anything else is a bug upstream.
+fn entry_return_for_descriptor(descriptor: &str) -> Result<EntryReturn> {
+    let return_type = descriptor
+        .rsplit_once(')')
+        .map(|(_params, ret)| ret)
+        .with_context(|| format!("entry descriptor `{descriptor}` is missing a return type"))?;
+    match return_type {
+        "I" => Ok(EntryReturn::Int),
+        "V" => Ok(EntryReturn::Void),
+        other => bail!(
+            "phase=link message=entry return type `{other}` has no delivery ABI yet (descriptor {descriptor})"
         ),
     }
 }

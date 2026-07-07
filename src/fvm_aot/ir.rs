@@ -34,10 +34,34 @@ pub(super) struct IrParam {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct BasicBlockIr {
     pub(super) id: BasicBlockId,
+    pub(super) params: Vec<IrParam>,
     pub(super) instrs: Vec<IrInstr>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// A control-flow edge that passes the predecessor's live frame values as
+/// arguments to the target block's parameters (the phi equivalent). `args`
+/// is positional and must match the target block's `params` in length, order,
+/// and type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BranchEdge {
+    pub(super) block: BasicBlockId,
+    pub(super) args: Vec<ValueId>,
+}
+
+impl BranchEdge {
+    pub(super) fn new(block: BasicBlockId, args: Vec<ValueId>) -> Self {
+        Self { block, args }
+    }
+
+    pub(super) fn to(block: BasicBlockId) -> Self {
+        Self {
+            block,
+            args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct BasicBlockId(u32);
 
 impl BasicBlockId {
@@ -73,8 +97,12 @@ pub(super) enum IrInstr {
     Compare(ValueId, IrCompareOp, ValueId, Option<ValueId>),
     Arithmetic(ValueId, IrArithmeticOp, ValueId, ValueId),
     Unary(ValueId, IrUnaryOp, ValueId),
-    Branch(BasicBlockId),
-    CondBranch(ValueId, BasicBlockId, BasicBlockId),
+    Branch(BranchEdge),
+    CondBranch(ValueId, BranchEdge, BranchEdge),
+    /// Multi-way branch on an int key: each `(match value, edge)` pair jumps to
+    /// its edge when the key equals the match; otherwise the default edge is
+    /// taken. Models `tableswitch`/`lookupswitch`.
+    Switch(ValueId, Vec<(i32, BranchEdge)>, BranchEdge),
     Call(Option<ValueId>, MethodRef, Vec<ValueId>),
     RuntimeCall(Option<ValueId>, RuntimeHelper, Vec<ValueId>),
     Return(Option<ValueId>),
@@ -108,6 +136,12 @@ pub(super) enum IrArithmeticOp {
     Mul,
     Div,
     Rem,
+    Shl,
+    Shr,
+    UShr,
+    And,
+    Or,
+    Xor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,6 +161,9 @@ pub(super) enum IrCompareOp {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum IrUnaryOp {
     Neg,
+    IntToByte,
+    IntToShort,
+    IntToChar,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

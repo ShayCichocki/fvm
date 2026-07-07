@@ -3,6 +3,11 @@ use anyhow::{Context, Result, bail};
 #[derive(Clone, Debug)]
 pub(super) struct ClassFile {
     pub(super) this_name: String,
+    /// The superclass's internal name. `None` only for `java/lang/Object`, whose
+    /// `super_class` constant-pool index is 0. Read by the object-model layout
+    /// pass, which the bin's dead-code analysis can't see yet (P4.4).
+    #[allow(dead_code)]
+    pub(super) super_name: Option<String>,
     constants: Vec<Option<Constant>>,
     pub(super) fields: Vec<Field>,
     pub(super) methods: Vec<Method>,
@@ -29,6 +34,13 @@ pub(super) struct Method {
 pub(super) struct Code {
     pub(super) max_locals: u16,
     pub(super) bytes: Vec<u8>,
+    /// Whether the method declares any exception handlers. The handler ranges
+    /// themselves are not modeled yet; lowering rejects such methods loudly
+    /// (Phase 5) rather than silently dropping the handlers as dead code. Only
+    /// the compiler path reads this, which is not yet wired into production
+    /// `main` (P4.4) — so the bin's dead-code pass can't see the read.
+    #[allow(dead_code)]
+    pub(super) has_exception_table: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -194,7 +206,7 @@ impl ClassFile {
 
         let _access_flags = reader.u2()?;
         let this_class = reader.u2()?;
-        let _super_class = reader.u2()?;
+        let super_class = reader.u2()?;
 
         skip_table(&mut reader, 2)?;
         let fields = parse_fields(&mut reader, &constants)?;
@@ -210,8 +222,25 @@ impl ClassFile {
             _ => bail!("classfile this_class did not point at a class constant"),
         };
 
+        // `super_class` is 0 only for `java/lang/Object`; every other class names
+        // a superclass constant.
+        let super_name = if super_class == 0 {
+            None
+        } else {
+            match constants
+                .get(super_class as usize)
+                .and_then(|constant| constant.as_ref())
+            {
+                Some(Constant::Class { name_index }) => {
+                    Some(utf8(&constants, *name_index)?.to_string())
+                }
+                _ => bail!("classfile super_class did not point at a class constant"),
+            }
+        };
+
         Ok(Self {
             this_name,
+            super_name,
             constants,
             fields,
             methods,
@@ -366,12 +395,14 @@ fn parse_methods(reader: &mut Reader<'_>, constants: &[Option<Constant>]) -> Res
                 let _max_stack = code_reader.u2()?;
                 let max_locals = code_reader.u2()?;
                 let code_length = code_reader.u4()? as usize;
-                code = Some(Code {
-                    max_locals,
-                    bytes: code_reader.bytes(code_length)?.to_vec(),
-                });
+                let bytes = code_reader.bytes(code_length)?.to_vec();
                 let exception_table_length = code_reader.u2()? as usize;
                 code_reader.skip(exception_table_length * 8)?;
+                code = Some(Code {
+                    max_locals,
+                    bytes,
+                    has_exception_table: exception_table_length > 0,
+                });
                 skip_attributes(&mut code_reader)?;
                 code_reader.finish()?;
             } else {

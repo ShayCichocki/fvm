@@ -1,4 +1,3 @@
-mod branches;
 mod bytecode;
 mod calls;
 mod metadata;

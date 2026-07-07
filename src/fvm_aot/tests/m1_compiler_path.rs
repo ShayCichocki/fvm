@@ -157,11 +157,12 @@ fn m1_compiler_path_required_fixture_rejects_evaluator_only_fallback() -> Result
     let message = format!("{err:#}");
     println!("{message}");
 
+    // `new Object()` now lowers, but the fixture still leans on unsupported
+    // constructs (getstatic `System.out`, virtual `println`), so the
+    // compiler-required path rejects it loudly instead of falling back to the
+    // evaluator's constant folding.
     assert!(message.contains("compiler-required"), "{message}");
-    assert!(
-        message.contains("runtime allocation") || message.contains("opcode 0xbb"),
-        "{message}"
-    );
+    assert!(message.contains("opcode 0x"), "{message}");
     Ok(())
 }
 

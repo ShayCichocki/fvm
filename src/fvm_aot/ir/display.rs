@@ -1,6 +1,6 @@
 use super::{
-    BasicBlockId, BasicBlockIr, FunctionIr, IrArithmeticOp, IrCompareOp, IrConst, IrInstr, IrType,
-    IrUnaryOp, TrapReason, ValueId,
+    BasicBlockId, BasicBlockIr, BranchEdge, FunctionIr, IrArithmeticOp, IrCompareOp, IrConst,
+    IrInstr, IrType, IrUnaryOp, TrapReason, ValueId,
 };
 use std::fmt;
 
@@ -19,7 +19,18 @@ impl fmt::Display for FunctionIr {
         }
         writeln!(output, " -> {} {{", self.return_type)?;
         for block in &self.blocks {
-            write!(output, "{} -> [", block.id)?;
+            write!(output, "{}", block.id)?;
+            if !block.params.is_empty() {
+                write!(output, "(")?;
+                for (index, param) in block.params.iter().enumerate() {
+                    if index > 0 {
+                        write!(output, ", ")?;
+                    }
+                    write!(output, "{}: {}", param.value, param.ty)?;
+                }
+                write!(output, ")")?;
+            }
+            write!(output, " -> [")?;
             for (index, successor) in successors(block).iter().enumerate() {
                 if index > 0 {
                     write!(output, ", ")?;
@@ -32,6 +43,23 @@ impl fmt::Display for FunctionIr {
             }
         }
         writeln!(output, "}}")
+    }
+}
+
+impl fmt::Display for BranchEdge {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(output, "{}", self.block)?;
+        if !self.args.is_empty() {
+            write!(output, "(")?;
+            for (index, arg) in self.args.iter().enumerate() {
+                if index > 0 {
+                    write!(output, ", ")?;
+                }
+                write!(output, "{arg}")?;
+            }
+            write!(output, ")")?;
+        }
+        Ok(())
     }
 }
 
@@ -74,12 +102,22 @@ impl fmt::Display for IrInstr {
             Self::Unary(value, op, input) => write!(output, "{value} = {op} {input}"),
             Self::Return(Some(value)) => write!(output, "return {value}"),
             Self::Return(None) => write!(output, "return"),
-            Self::Branch(target) => write!(output, "branch {target}"),
+            Self::Branch(edge) => write!(output, "branch {edge}"),
             Self::CondBranch(condition, then_target, else_target) => {
                 write!(
                     output,
                     "branch_if {condition}, {then_target}, {else_target}"
                 )
+            }
+            Self::Switch(key, cases, default) => {
+                write!(output, "switch {key} [")?;
+                for (index, (value, edge)) in cases.iter().enumerate() {
+                    if index > 0 {
+                        write!(output, ", ")?;
+                    }
+                    write!(output, "{value} -> {edge}")?;
+                }
+                write!(output, "] default {default}")
             }
             Self::ExceptionEdge(exception, target) => {
                 write!(output, "exception_edge {exception} -> {target}")
@@ -123,6 +161,12 @@ impl fmt::Display for IrArithmeticOp {
             Self::Mul => write!(output, "mul"),
             Self::Div => write!(output, "div"),
             Self::Rem => write!(output, "rem"),
+            Self::Shl => write!(output, "shl"),
+            Self::Shr => write!(output, "shr"),
+            Self::UShr => write!(output, "ushr"),
+            Self::And => write!(output, "and"),
+            Self::Or => write!(output, "or"),
+            Self::Xor => write!(output, "xor"),
         }
     }
 }
@@ -150,6 +194,9 @@ impl fmt::Display for IrUnaryOp {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Neg => write!(output, "neg"),
+            Self::IntToByte => write!(output, "i2b"),
+            Self::IntToShort => write!(output, "i2s"),
+            Self::IntToChar => write!(output, "i2c"),
         }
     }
 }
@@ -167,10 +214,15 @@ impl fmt::Display for TrapReason {
 
 fn successors(block: &BasicBlockIr) -> Vec<BasicBlockId> {
     match block.instrs.last() {
-        Some(IrInstr::Branch(target)) => vec![*target],
+        Some(IrInstr::Branch(edge)) => vec![edge.block],
         Some(IrInstr::CondBranch(_, then_target, else_target)) => {
-            vec![*then_target, *else_target]
+            vec![then_target.block, else_target.block]
         }
+        Some(IrInstr::Switch(_, cases, default)) => cases
+            .iter()
+            .map(|(_, edge)| edge.block)
+            .chain(std::iter::once(default.block))
+            .collect(),
         Some(
             IrInstr::Param(..)
             | IrInstr::Constant(..)

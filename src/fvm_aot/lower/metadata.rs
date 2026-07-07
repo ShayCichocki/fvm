@@ -33,6 +33,19 @@ pub(super) fn ir_type_for_jvm(ty: &JvmType, role: &str, method_label: &str) -> R
     }
 }
 
+/// Resolve a field descriptor to its IR type. Reference and int-like fields are
+/// supported; wide primitives (long/float/double) are rejected with a milestone
+/// diagnostic until P2.7.
+pub(super) fn field_ir_type(descriptor: &str, method_label: &str) -> Result<IrType> {
+    let ty = ir_type_for_descriptor(descriptor)?;
+    if matches!(ty, IrType::Unsupported(_)) {
+        bail!(
+            "fvm-aot lowerer unsupported field type `{descriptor}` in {method_label}; required feature: wide primitive fields; planned milestone: primitive-completeness"
+        );
+    }
+    Ok(ty)
+}
+
 fn ir_type_for_descriptor(descriptor: &str) -> Result<IrType> {
     match descriptor {
         "B" | "S" | "I" => Ok(IrType::Int),

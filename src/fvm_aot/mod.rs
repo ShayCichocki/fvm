@@ -11,6 +11,7 @@ mod ir_verify;
 mod link;
 #[cfg(test)]
 mod lower;
+mod object_model;
 mod reachability;
 mod runtime_stub;
 #[cfg(test)]
