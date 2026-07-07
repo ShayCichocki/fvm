@@ -435,6 +435,50 @@ impl LowerState {
         Ok(())
     }
 
+    /// `instanceof`: pop the reference, push an `int` 0/1 result.
+    pub(super) fn push_instance_of(&mut self, target: String) -> Result<()> {
+        let object = self.pop_stack()?;
+        let value = self.new_value();
+        self.instrs
+            .push(IrInstr::InstanceOf(value, object, target));
+        self.stack.push(TypedValue {
+            value,
+            ty: IrType::Int,
+        });
+        Ok(())
+    }
+
+    /// `checkcast`: guard the top-of-stack reference, then leave it in place with
+    /// its static type refined to the target class.
+    pub(super) fn check_cast(&mut self, target: String) -> Result<()> {
+        let object = self.pop_typed()?;
+        self.instrs
+            .push(IrInstr::CheckCast(object.value, target.clone()));
+        self.stack.push(TypedValue {
+            value: object.value,
+            ty: IrType::Object(target),
+        });
+        Ok(())
+    }
+
+    /// `getstatic` of an application class field: load from per-class static
+    /// storage. No receiver and no null check — static storage always exists.
+    pub(super) fn push_static_get(&mut self, field: FieldRef) {
+        let value = self.new_value();
+        let ty = field.ty.clone();
+        self.instrs.push(IrInstr::FieldGet(value, field, None));
+        self.stack.push(TypedValue { value, ty });
+    }
+
+    /// `putstatic` of an application class field: store into per-class static
+    /// storage. No receiver and no null check.
+    pub(super) fn store_static_put(&mut self, field: FieldRef) -> Result<()> {
+        let value = self.pop_typed()?;
+        self.instrs
+            .push(IrInstr::FieldPut(field, None, value.value));
+        Ok(())
+    }
+
     pub(super) fn push_new_array(&mut self, element: IrType) -> Result<()> {
         let length = self.pop_stack()?;
         let value = self.new_value();
@@ -515,6 +559,38 @@ impl LowerState {
         Ok(())
     }
 
+    /// `baload`/`caload`/`saload` derive the sub-word element type from the
+    /// array's static type (the opcode doesn't fully encode it — `baload` serves
+    /// both `byte[]` and `boolean[]`). The loaded value is widened to `int` on
+    /// the operand stack, per JVM semantics.
+    pub(super) fn push_subword_array_load(&mut self) -> Result<()> {
+        let index = self.pop_stack()?;
+        let array = self.pop_typed()?;
+        let element = subword_array_element(&array.ty)?;
+        self.guard_array_access(array.value, index);
+        let value = self.new_value();
+        self.instrs
+            .push(IrInstr::ArrayLoad(value, array.value, index, element));
+        self.stack.push(TypedValue {
+            value,
+            ty: IrType::Int,
+        });
+        Ok(())
+    }
+
+    /// `bastore`/`castore`/`sastore` truncate the `int` on the stack to the
+    /// array's sub-word element width.
+    pub(super) fn store_subword_array_store(&mut self) -> Result<()> {
+        let value = self.pop_stack()?;
+        let index = self.pop_stack()?;
+        let array = self.pop_typed()?;
+        let element = subword_array_element(&array.ty)?;
+        self.guard_array_access(array.value, index);
+        self.instrs
+            .push(IrInstr::ArrayStore(array.value, index, value, element));
+        Ok(())
+    }
+
     /// Emit the null check and bounds check that guard every array element
     /// access: the array must be non-null, and the index must fall within the
     /// length loaded via `ArrayLength`.
@@ -573,6 +649,24 @@ fn reference_array_element(array_ty: &IrType) -> Result<IrType> {
     match array_ty {
         IrType::Array(component) => Ok((**component).clone()),
         other => bail!("fvm-aot lowerer reference array access on non-array type {other}"),
+    }
+}
+
+/// The sub-word element type of a `byte[]`/`boolean[]`/`char[]`/`short[]`. The
+/// array's static type must be an array of a sub-word primitive.
+fn subword_array_element(array_ty: &IrType) -> Result<IrType> {
+    match array_ty {
+        IrType::Array(component)
+            if matches!(
+                **component,
+                IrType::Byte | IrType::Boolean | IrType::Char | IrType::Short
+            ) =>
+        {
+            Ok((**component).clone())
+        }
+        other => bail!(
+            "fvm-aot lowerer sub-word array access expects a byte/boolean/char/short array, got {other}"
+        ),
     }
 }
 

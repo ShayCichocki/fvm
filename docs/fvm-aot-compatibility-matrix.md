@@ -89,7 +89,7 @@ Status values:
 | switch | `tableswitch`, `lookupswitch` | Supported | Compiler path (lowered to a compare chain). |
 | returns current | `ireturn`, `areturn`, `return` | Supported | Compiler path. |
 | returns full | `lreturn`, `freturn`, `dreturn` | Planned | Required. |
-| static fields | `getstatic`, `putstatic` | Partial | Only `getstatic System.out` is intrinsified; app static storage and `putstatic` planned. |
+| static fields | `getstatic`, `putstatic` | Supported | `getstatic System.out` intrinsified; closed-world app statics read/written against per-class zero-initialized static storage, `<clinit>`-initialized. Other JDK statics rejected loudly. |
 | instance fields | `getfield`, `putfield` | Supported | Runtime field access on app objects, null-checked. |
 | method calls | `invokestatic`, `invokespecial` | Supported | Static calls and constructors on app classes, at runtime. |
 | method calls (virtual) | `invokevirtual`, `invokeinterface` | Partial | Only `System.out.print/println` is intrinsified; general virtual/interface dispatch (vtables) planned. |
@@ -112,12 +112,12 @@ Status values:
 | Feature | Status | Required For | Notes |
 |---|---:|---|---|
 | Build-time static initialization | Rejected for now | — | Evaluator-only; being retired. |
-| Runtime class initialization | Planned | Real Java | Required for side-effecting `<clinit>`. |
+| Runtime class initialization | Supported | Real Java | `<clinit>()V` compiled and run at process start in dependency order (batched, not yet lazy/interleaved). Side effects execute in the guest. |
 | Object header | Supported | Runtime allocation | 8-byte header with a numeric class id; identity hash/GC bits reserved. |
 | Class metadata | Partial | Dispatch, reflection, exceptions | Class ids + superclass-first field layout done; vtables/reflection planned. |
 | Vtables | Planned | Virtual dispatch | Needed for compiled virtual methods. |
 | Itables | Planned | Interface dispatch | Needed for compiled methods. |
-| Static field storage | Planned | Runtime classes | No app static storage yet; only `System.out` intrinsic. |
+| Static field storage | Supported | Runtime classes | Per-class zero-initialized static storage block; int-like and reference statics, initialized by `<clinit>` at startup. Wide-primitive statics pending (P2.7). |
 | Bump allocator | Supported | Runtime allocation | Fixed zeroed heap, 8-byte aligned, deterministic OOM abort. |
 | GC | Planned | Long-running services | Stop-the-world first; interim allocator never frees. |
 | Runtime traps | Supported | Safety | Divide-by-zero, null, array-bounds, negative-array-size → Java-shaped message + `exit(1)`. |

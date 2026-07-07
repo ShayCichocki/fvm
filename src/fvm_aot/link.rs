@@ -21,6 +21,10 @@ pub(super) struct LinkSpec<'a> {
     pub(super) object_bytes: &'a [u8],
     pub(super) entry_symbol: &'a str,
     pub(super) entry_return: EntryReturn,
+    /// Class-initializer symbols (`<clinit>`), in the order they must run before
+    /// the entry. Each is a `void(void)` function the generated `main` calls up
+    /// front so static fields hold their initialized values (P2.4).
+    pub(super) clinit_symbols: &'a [String],
     pub(super) output_path: &'a Path,
 }
 
@@ -44,6 +48,13 @@ pub(super) fn link_cranelift_object_with_runtime_stub(
             spec.entry_symbol
         );
     }
+    for clinit in spec.clinit_symbols {
+        if !is_c_identifier(clinit) {
+            bail!(
+                "fvm-aot refuses to splice class-initializer symbol `{clinit}` into generated C: not a valid C identifier"
+            );
+        }
+    }
 
     let temp = tempfile::tempdir().context("failed to create fvm-aot link directory")?;
     let object_path = temp.path().join("fvm_aot_app.o");
@@ -54,7 +65,7 @@ pub(super) fn link_cranelift_object_with_runtime_stub(
         .with_context(|| format!("failed to write Cranelift object {}", object_path.display()))?;
     std::fs::write(
         &stub_source_path,
-        runtime_stub_source(spec.entry_symbol, spec.entry_return),
+        runtime_stub_source(spec.entry_symbol, spec.entry_return, spec.clinit_symbols),
     )
     .with_context(|| {
         format!(
@@ -89,14 +100,33 @@ pub(super) fn link_cranelift_object_with_runtime_stub(
     })
 }
 
-fn runtime_stub_source(entry_symbol: &str, entry_return: EntryReturn) -> String {
+fn runtime_stub_source(
+    entry_symbol: &str,
+    entry_return: EntryReturn,
+    clinit_symbols: &[String],
+) -> String {
     let mut source = emit_runtime_stub_c();
     source.push('\n');
+    for clinit in clinit_symbols {
+        source.push_str("extern void ");
+        source.push_str(clinit);
+        source.push_str("(void);\n");
+    }
+    // The class initializers run first (in dependency order) so static fields
+    // hold their `<clinit>`-installed values before the entry executes.
+    let mut run_clinits = String::new();
+    for clinit in clinit_symbols {
+        run_clinits.push_str("  ");
+        run_clinits.push_str(clinit);
+        run_clinits.push_str("();\n");
+    }
     match entry_return {
         EntryReturn::Int => {
             source.push_str("extern int ");
             source.push_str(entry_symbol);
-            source.push_str("(void);\nint main(void) {\n  ");
+            source.push_str("(void);\nint main(void) {\n");
+            source.push_str(&run_clinits);
+            source.push_str("  ");
             source.push_str(PRINT_INT_SYMBOL);
             source.push('(');
             source.push_str(entry_symbol);
@@ -105,7 +135,9 @@ fn runtime_stub_source(entry_symbol: &str, entry_return: EntryReturn) -> String 
         EntryReturn::Void => {
             source.push_str("extern void ");
             source.push_str(entry_symbol);
-            source.push_str("(void);\nint main(void) {\n  ");
+            source.push_str("(void);\nint main(void) {\n");
+            source.push_str(&run_clinits);
+            source.push_str("  ");
             source.push_str(entry_symbol);
             source.push_str("();\n  return 0;\n}\n");
         }

@@ -30,25 +30,43 @@ pub(super) fn push_ldc_constant(input: &mut CallLowering<'_, '_>, index: u16) ->
     )
 }
 
-/// `getstatic` is only supported for `System.out` today: it pushes a sentinel
-/// PrintStream reference that `invokevirtual` recognizes for `print`/`println`.
-/// Application static fields await P2.3.
+/// `getstatic` pushes `System.out` as a sentinel PrintStream, or reads an
+/// application class's static field from its per-class static storage. Static
+/// fields of classes outside the closed world (other JDK statics) surface as a
+/// loud codegen diagnostic — no static storage exists for them.
 pub(super) fn lower_getstatic(input: &mut CallLowering<'_, '_>) -> Result<()> {
-    let field = input
+    let member = input
         .class_file
         .field_ref(read_u16(&input.code.bytes, input.pc)?)?;
-    if field.class == "java/lang/System"
-        && field.name == "out"
-        && field.descriptor == "Ljava/io/PrintStream;"
+    if member.class == "java/lang/System"
+        && member.name == "out"
+        && member.descriptor == "Ljava/io/PrintStream;"
     {
         input.state.push_stdout();
         return Ok(());
     }
-    bail!(
-        "fvm-aot lowerer only supports getstatic of System.out today, not {}.{}; required feature: static fields; planned milestone: static-init",
-        field.class,
-        field.name
-    )
+    let ty = field_ir_type(&member.descriptor, input.method_label)?;
+    input.state.push_static_get(FieldRef {
+        class: member.class,
+        name: member.name,
+        ty,
+    });
+    Ok(())
+}
+
+/// `putstatic` writes an application class's static field into its per-class
+/// static storage. As with `getstatic`, fields outside the closed world are
+/// rejected loudly in codegen.
+pub(super) fn lower_putstatic(input: &mut CallLowering<'_, '_>) -> Result<()> {
+    let member = input
+        .class_file
+        .field_ref(read_u16(&input.code.bytes, input.pc)?)?;
+    let ty = field_ir_type(&member.descriptor, input.method_label)?;
+    input.state.store_static_put(FieldRef {
+        class: member.class,
+        name: member.name,
+        ty,
+    })
 }
 
 /// `invokevirtual` is intrinsified only for `System.out` `print`/`println`.

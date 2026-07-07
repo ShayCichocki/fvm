@@ -375,11 +375,10 @@ fn decode_instruction(code: &[u8], bci: usize) -> Result<DecodedInstruction> {
         0x01..=0x08
         | 0x1a..=0x1d
         | 0x2a..=0x2e
-        | 0x32
+        | 0x32..=0x35
         | 0x3b..=0x3e
         | 0x4b..=0x4f
-        | 0x53
-        | 0x57
+        | 0x53..=0x57
         | 0x58..=0x5f
         | 0x60
         | 0x64
@@ -429,10 +428,10 @@ fn decode_instruction(code: &[u8], bci: usize) -> Result<DecodedInstruction> {
             targets.extend(table.cases.iter().map(|(_, target)| *target));
             ControlFlow::Switch { targets }
         }
-        0xb2 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb | 0xbd => {
-            // getstatic / getfield / putfield / invokevirtual / invokespecial /
-            // invokestatic / new / anewarray — each takes a two-byte
-            // constant-pool index.
+        0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb | 0xbd | 0xc0 | 0xc1 => {
+            // getstatic / putstatic / getfield / putfield / invokevirtual /
+            // invokespecial / invokestatic / new / anewarray / checkcast /
+            // instanceof — each takes a two-byte constant-pool index.
             let _ = read_u16(code, &mut pc)?;
             ControlFlow::Normal
         }

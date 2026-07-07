@@ -84,10 +84,23 @@ pub(super) enum IrType {
     Void,
     Int,
     Boolean,
+    Byte,
+    Short,
     Char,
     Object(String),
     Array(Box<IrType>),
     Unsupported(String),
+}
+
+impl IrType {
+    /// Whether this type is one of the int-like primitives the JVM widens to
+    /// `int` on the operand stack (`byte`/`short`/`char`/`boolean`/`int`).
+    pub(super) fn is_int_like(&self) -> bool {
+        matches!(
+            self,
+            IrType::Int | IrType::Boolean | IrType::Byte | IrType::Short | IrType::Char
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +126,12 @@ pub(super) enum IrInstr {
     ArrayLength(ValueId, ValueId),
     NewObject(ValueId, String),
     NewArray(ValueId, IrType, ValueId),
+    /// `instanceof`: result is `int` 0/1 — 1 iff the object is non-null and its
+    /// runtime class is a subtype of the named target class.
+    InstanceOf(ValueId, ValueId, String),
+    /// `checkcast`: a guard on the object reference — traps `ClassCast` unless the
+    /// object is null or its runtime class is a subtype of the named target class.
+    CheckCast(ValueId, String),
     ZeroCheck(ValueId, TrapReason),
     NullCheck(ValueId, TrapReason),
     BoundsCheck(ValueId, ValueId, TrapReason),
@@ -203,5 +222,6 @@ pub(super) enum TrapReason {
     NullReference,
     Bounds,
     DivideByZero,
+    ClassCast,
     Unsupported(String),
 }

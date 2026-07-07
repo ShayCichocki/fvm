@@ -97,7 +97,7 @@ impl ValueScope {
 
     pub(super) fn require_int_like(&self, block: BasicBlockId, value: ValueId) -> Result<IrType> {
         let ty = self.use_value(block, value)?;
-        if matches!(ty, IrType::Int | IrType::Boolean | IrType::Char) {
+        if ty.is_int_like() {
             return Ok(ty);
         }
         bail!(

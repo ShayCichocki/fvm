@@ -45,11 +45,13 @@ pub(super) fn return_compatible(expected: &IrType, actual: &IrType) -> bool {
         return true;
     }
     match (expected, actual) {
-        (IrType::Boolean | IrType::Char, IrType::Int) => true,
+        (IrType::Boolean | IrType::Byte | IrType::Short | IrType::Char, IrType::Int) => true,
         (IrType::Object(_) | IrType::Array(_), IrType::Object(class)) => class == "null",
         (IrType::Void, _)
         | (IrType::Int, _)
         | (IrType::Boolean, _)
+        | (IrType::Byte, _)
+        | (IrType::Short, _)
         | (IrType::Char, _)
         | (IrType::Object(_), _)
         | (IrType::Array(_), _)
@@ -74,7 +76,13 @@ pub(super) fn verify_descriptor_model_return(
 
 pub(super) fn verify_supported_type(label: &str, role: &str, ty: &IrType) -> Result<()> {
     match ty {
-        IrType::Void | IrType::Int | IrType::Boolean | IrType::Char | IrType::Object(_) => Ok(()),
+        IrType::Void
+        | IrType::Int
+        | IrType::Boolean
+        | IrType::Byte
+        | IrType::Short
+        | IrType::Char
+        | IrType::Object(_) => Ok(()),
         IrType::Array(element) => verify_supported_type(label, role, element),
         IrType::Unsupported(_) => bail!("IR function `{label}` has unsupported {role}: {ty}"),
     }
@@ -92,6 +100,9 @@ pub(super) fn verify_supported_trap(label: &str, reason: &TrapReason) -> Result<
 fn descriptor_type(descriptor: &str) -> Result<IrType> {
     match descriptor {
         "V" => Ok(IrType::Void),
+        // Scalar `byte`/`short` are widened to `int` on the operand stack, so a
+        // scalar field/return models as `int`. Inside arrays they keep their
+        // narrow width — see `array_component_type`.
         "B" | "S" | "I" => Ok(IrType::Int),
         "Z" => Ok(IrType::Boolean),
         "C" => Ok(IrType::Char),
@@ -99,9 +110,20 @@ fn descriptor_type(descriptor: &str) -> Result<IrType> {
         descriptor if descriptor.starts_with('L') && descriptor.ends_with(';') => Ok(
             IrType::Object(descriptor[1..descriptor.len() - 1].to_string()),
         ),
-        descriptor if descriptor.starts_with('[') => {
-            Ok(IrType::Array(Box::new(descriptor_type(&descriptor[1..])?)))
-        }
+        descriptor if descriptor.starts_with('[') => Ok(IrType::Array(Box::new(
+            array_component_type(&descriptor[1..])?,
+        ))),
         other => Ok(IrType::Unsupported(other.to_string())),
+    }
+}
+
+/// An array component keeps its narrow storage type (`byte`/`short` distinct
+/// from `int`) so element strides and load widths are exact — unlike scalar
+/// fields, which widen to `int`.
+fn array_component_type(descriptor: &str) -> Result<IrType> {
+    match descriptor {
+        "B" => Ok(IrType::Byte),
+        "S" => Ok(IrType::Short),
+        _ => descriptor_type(descriptor),
     }
 }

@@ -31,17 +31,68 @@ use std::collections::{BTreeMap, HashMap};
 /// literals share one blob (a small step toward literal interning, P3.1).
 type StringPool = HashMap<Vec<u8>, DataId>;
 
+/// Per-class static storage blocks (`getstatic`/`putstatic` targets), keyed by
+/// class name. Declared once per object so every function shares one block.
+type StaticsPool = HashMap<String, DataId>;
+
 pub(super) fn emit_functions(
     module: &mut ObjectModule,
     functions: &[&FunctionIr],
     model: &ObjectModel,
 ) -> Result<(), CodegenError> {
     let ids = declare_functions(module, functions)?;
+    let statics = declare_static_storage(module, model)?;
     let mut strings = StringPool::new();
     for function in functions {
-        emit_function(module, function, &ids, model, &mut strings)?;
+        emit_function(module, function, &ids, model, &statics, &mut strings)?;
     }
     Ok(())
+}
+
+/// Reserve one zero-initialized data object per class that declares static
+/// fields. Zero-init gives Java's default static values (0/null) for free; the
+/// object is writable so `putstatic` can mutate it, and `<clinit>` runs at
+/// startup to install non-default values.
+fn declare_static_storage(
+    module: &mut ObjectModule,
+    model: &ObjectModel,
+) -> Result<StaticsPool, CodegenError> {
+    let mut statics = StaticsPool::new();
+    for (class, layout) in model.classes() {
+        if layout.static_size == 0 {
+            continue;
+        }
+        let name = static_storage_symbol(class);
+        let data_id = module
+            .declare_data(&name, Linkage::Local, true, false)
+            .map_err(|source| CodegenError::Backend {
+                function: format!("statics:{class}"),
+                message: source.to_string(),
+            })?;
+        let mut description = DataDescription::new();
+        description.define_zeroinit(layout.static_size as usize);
+        module
+            .define_data(data_id, &description)
+            .map_err(|source| CodegenError::Backend {
+                function: format!("statics:{class}"),
+                message: source.to_string(),
+            })?;
+        statics.insert(class.clone(), data_id);
+    }
+    Ok(statics)
+}
+
+/// Local linkage symbol for a class's static storage block. Non-alphanumerics
+/// become `_`, matching the readable-name half of [`exported_symbol`].
+fn static_storage_symbol(class: &str) -> String {
+    let mut symbol = String::from("fvm_statics_");
+    for character in class.chars() {
+        match character {
+            'A'..='Z' | 'a'..='z' | '0'..='9' => symbol.push(character),
+            _ => symbol.push('_'),
+        }
+    }
+    symbol
 }
 
 pub(super) fn signature(
@@ -77,11 +128,13 @@ fn declare_functions(
     Ok(ids)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_function(
     module: &mut ObjectModule,
     function: &FunctionIr,
     ids: &BTreeMap<String, FuncId>,
     model: &ObjectModel,
+    statics: &StaticsPool,
     strings: &mut StringPool,
 ) -> Result<(), CodegenError> {
     let func_id = *ids
@@ -136,6 +189,7 @@ fn emit_function(
                 &clif_blocks,
                 &mut values,
                 model,
+                statics,
                 strings,
                 instr,
             )?;
@@ -162,6 +216,7 @@ fn lower_instr(
     clif_blocks: &HashMap<BasicBlockId, Block>,
     values: &mut HashMap<ValueId, Value>,
     model: &ObjectModel,
+    statics: &StaticsPool,
     strings: &mut StringPool,
     instr: &IrInstr,
 ) -> Result<(), CodegenError> {
@@ -334,9 +389,23 @@ fn lower_instr(
         IrInstr::ArrayLoad(value, array, index, element) => {
             let array = require_value(function, values, *array)?;
             let index = require_value(function, values, *index)?;
-            let ty = clif_type(function, element)?;
             let addr = array_element_address(function, builder, array, index, element)?;
-            let loaded = builder.ins().load(ty, MemFlagsData::trusted(), addr, 0);
+            let loaded = match array_element_storage(element) {
+                // Sub-word element: load the narrow width, then widen to the i32
+                // the JVM leaves on the stack (sign vs zero per element type).
+                Some((narrow, signed)) => {
+                    let raw = builder.ins().load(narrow, MemFlagsData::trusted(), addr, 0);
+                    if signed {
+                        builder.ins().sextend(types::I32, raw)
+                    } else {
+                        builder.ins().uextend(types::I32, raw)
+                    }
+                }
+                None => {
+                    let ty = clif_type(function, element)?;
+                    builder.ins().load(ty, MemFlagsData::trusted(), addr, 0)
+                }
+            };
             values.insert(*value, loaded);
             Ok(())
         }
@@ -345,6 +414,11 @@ fn lower_instr(
             let index = require_value(function, values, *index)?;
             let stored = require_value(function, values, *value)?;
             let addr = array_element_address(function, builder, array, index, element)?;
+            // Sub-word element: truncate the i32 stack value to the stored width.
+            let stored = match array_element_storage(element) {
+                Some((narrow, _signed)) => builder.ins().ireduce(narrow, stored),
+                None => stored,
+            };
             builder
                 .ins()
                 .store(MemFlagsData::trusted(), stored, addr, 0);
@@ -374,11 +448,24 @@ fn lower_instr(
                 &[index, length],
             )
         }
-        IrInstr::FieldGet(_, _, None) | IrInstr::FieldPut(_, None, _) => unsupported(
-            function,
-            instruction_category(instr),
-            "static fields (getstatic/putstatic) are not compiled yet",
-        ),
+        IrInstr::FieldGet(value, field, None) => {
+            let (base, offset, ty) =
+                static_field_address(module, builder, function, model, statics, field)?;
+            let loaded = builder
+                .ins()
+                .load(ty, MemFlagsData::trusted(), base, offset);
+            values.insert(*value, loaded);
+            Ok(())
+        }
+        IrInstr::FieldPut(field, None, value) => {
+            let stored = require_value(function, values, *value)?;
+            let (base, offset, _ty) =
+                static_field_address(module, builder, function, model, statics, field)?;
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), stored, base, offset);
+            Ok(())
+        }
         other => unsupported(
             function,
             instruction_category(other),
@@ -819,17 +906,38 @@ fn array_element_address(
     Ok(builder.ins().iadd(base, byte_offset))
 }
 
-/// Element storage width in bytes. Only int-like (4) and reference (8) elements
-/// are supported today; sub-word arrays (byte/char/short) arrive later.
+/// Element storage width in bytes. `byte`/`boolean` pack into 1, `char`/`short`
+/// into 2, `int` into 4, references into 8. `long`/`double` arrays (8-byte
+/// primitives) arrive with P2.7.
 fn element_stride(function: &FunctionIr, element: &IrType) -> Result<u32, CodegenError> {
     match element {
+        IrType::Boolean | IrType::Byte => Ok(1),
+        IrType::Char | IrType::Short => Ok(2),
         IrType::Int => Ok(4),
         IrType::Object(_) | IrType::Array(_) => Ok(REFERENCE_BYTES),
-        IrType::Boolean | IrType::Char | IrType::Void | IrType::Unsupported(_) => unsupported(
+        IrType::Void | IrType::Unsupported(_) => unsupported(
             function,
             "Array",
-            "only int and reference array elements are supported today",
+            "only int-like and reference array elements are supported today",
         ),
+    }
+}
+
+/// Cranelift storage type + how a loaded sub-word value widens to the `i32` the
+/// JVM leaves on the operand stack. `signed` picks `sextend` (`byte`/`short`)
+/// vs `uextend` (`boolean`/`char`); `None` means the element is already a full
+/// register type (`int` → i32, reference → i64) loaded directly.
+fn array_element_storage(element: &IrType) -> Option<(Type, bool)> {
+    match element {
+        IrType::Byte => Some((types::I8, true)),
+        IrType::Boolean => Some((types::I8, false)),
+        IrType::Short => Some((types::I16, true)),
+        IrType::Char => Some((types::I16, false)),
+        IrType::Int
+        | IrType::Object(_)
+        | IrType::Array(_)
+        | IrType::Void
+        | IrType::Unsupported(_) => None,
     }
 }
 
@@ -855,6 +963,51 @@ fn resolve_field(
             detail: format!("class {} has no field {}", field.class, field.name),
         })?;
     Ok((slot.offset, clif_type(function, &slot.ty)?))
+}
+
+/// Resolve a static field access to `(base pointer, byte offset, load/store
+/// type)`. The base is a pointer to the class's static storage block; the offset
+/// and type come from the layout. Classes with no static storage (JDK statics
+/// outside the closed world, or unsupported-width fields) fail loudly here.
+fn static_field_address(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    function: &FunctionIr,
+    model: &ObjectModel,
+    statics: &StaticsPool,
+    field: &FieldRef,
+) -> Result<(Value, i32, Type), CodegenError> {
+    let layout = model
+        .class(&field.class)
+        .ok_or_else(|| CodegenError::Unsupported {
+            function: function_label(function),
+            category: "StaticField",
+            detail: format!(
+                "no static storage for class {}; required feature: static fields of closed-world classes; planned milestone: static-init",
+                field.class
+            ),
+        })?;
+    let slot = layout
+        .static_field(&field.name)
+        .ok_or_else(|| CodegenError::Unsupported {
+            function: function_label(function),
+            category: "StaticField",
+            detail: format!(
+                "class {} has no static field {} (unsupported field width, or not a closed-world static)",
+                field.class, field.name
+            ),
+        })?;
+    let data_id = *statics
+        .get(&field.class)
+        .ok_or_else(|| CodegenError::Unsupported {
+            function: function_label(function),
+            category: "StaticField",
+            detail: format!("no static storage block emitted for class {}", field.class),
+        })?;
+    let ty = clif_type(function, &slot.ty)?;
+    let global = module.declare_data_in_func(data_id, builder.func);
+    let base = builder.ins().symbol_value(types::I64, global);
+    Ok((base, offset_of(function, slot.offset)?, ty))
 }
 
 fn offset_of(function: &FunctionIr, offset: u32) -> Result<i32, CodegenError> {
@@ -887,7 +1040,9 @@ fn require_block(
 
 fn clif_type(function: &FunctionIr, ty: &IrType) -> Result<Type, CodegenError> {
     match ty {
-        IrType::Int | IrType::Boolean | IrType::Char => Ok(types::I32),
+        IrType::Int | IrType::Boolean | IrType::Byte | IrType::Short | IrType::Char => {
+            Ok(types::I32)
+        }
         // References are raw pointers.
         IrType::Object(_) | IrType::Array(_) => Ok(types::I64),
         IrType::Void | IrType::Unsupported(_) => unsupported(

@@ -8,6 +8,8 @@ pub(super) struct ClassFile {
     /// pass, which the bin's dead-code analysis can't see yet (P4.4).
     #[allow(dead_code)]
     pub(super) super_name: Option<String>,
+    #[allow(dead_code)]
+    pub(super) access_flags: u16,
     constants: Vec<Option<Constant>>,
     pub(super) fields: Vec<Field>,
     pub(super) methods: Vec<Method>,
@@ -204,7 +206,7 @@ impl ClassFile {
             index += 1;
         }
 
-        let _access_flags = reader.u2()?;
+        let access_flags = reader.u2()?;
         let this_class = reader.u2()?;
         let super_class = reader.u2()?;
 
@@ -241,11 +243,20 @@ impl ClassFile {
         Ok(Self {
             this_name,
             super_name,
+            access_flags,
             constants,
             fields,
             methods,
             bootstrap_methods,
         })
+    }
+
+    /// Whether this class file is an interface (`ACC_INTERFACE`). Interfaces are
+    /// not modeled by the object layout, so `instanceof`/`checkcast` against them
+    /// is rejected until interface metadata lands (P3.3).
+    pub(super) fn is_interface(&self) -> bool {
+        const ACC_INTERFACE: u16 = 0x0200;
+        self.access_flags & ACC_INTERFACE != 0
     }
 
     pub(super) fn constant(&self, index: u16) -> Result<&Constant> {

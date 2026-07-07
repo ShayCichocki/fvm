@@ -7,8 +7,18 @@ use crate::fvm_aot::link::{
 use crate::fvm_aot::lower::lower_method_to_ir;
 use crate::fvm_aot::object_model::ObjectModel;
 use anyhow::{Context, Result, bail};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+
+const CLINIT_NAME: &str = "<clinit>";
+const CLINIT_DESCRIPTOR: &str = "()V";
+
+/// The result of walking the compile closure: every function to emit, plus the
+/// class-initializer symbols (`<clinit>`) in the order they must run at startup.
+struct LoweredClosure {
+    functions: Vec<FunctionIr>,
+    clinit_symbols: Vec<String>,
+}
 
 pub(in crate::fvm_aot) struct StaticIntMethodSpec<'a> {
     pub(in crate::fvm_aot) class: &'a str,
@@ -68,7 +78,7 @@ impl CompilerPipeline {
             return Ok(());
         }
 
-        let functions = lowered.iter().collect::<Vec<_>>();
+        let functions = lowered.functions.iter().collect::<Vec<_>>();
         let model = ObjectModel::from_classes(&self.world.classes)?;
         let object = emit_objects(&functions, &model)?;
         let entry_name = format!("{}.main", self.main_class.replace('/', "."));
@@ -78,6 +88,7 @@ impl CompilerPipeline {
             object_bytes: &object,
             entry_symbol: &entry_symbol,
             entry_return: EntryReturn::Void,
+            clinit_symbols: &lowered.clinit_symbols,
             output_path,
         })?;
         Ok(())
@@ -89,7 +100,7 @@ impl CompilerPipeline {
     ) -> Result<NativeStaticIntMethod> {
         let entry = MethodKey::new(&spec.class.replace('.', "/"), spec.name, spec.descriptor);
         let lowered = self.lower_static_int_closure(entry)?;
-        let functions = lowered.iter().collect::<Vec<_>>();
+        let functions = lowered.functions.iter().collect::<Vec<_>>();
         let model = ObjectModel::from_classes(&self.world.classes)?;
         let object = emit_objects(&functions, &model)?;
         let entry_name = format!("{}.{}", spec.class.replace('/', "."), spec.name);
@@ -99,16 +110,25 @@ impl CompilerPipeline {
             object_bytes: &object,
             entry_symbol: &entry_symbol,
             entry_return: entry_return_for_descriptor(spec.descriptor)?,
+            clinit_symbols: &lowered.clinit_symbols,
             output_path: spec.output_path,
         })?;
 
         Ok(NativeStaticIntMethod::from_linked(linked, entry_symbol))
     }
 
-    fn lower_static_int_closure(&self, entry: MethodKey) -> Result<Vec<FunctionIr>> {
-        let mut queue = VecDeque::from([entry]);
+    fn lower_static_int_closure(&self, entry: MethodKey) -> Result<LoweredClosure> {
+        let mut queue = VecDeque::from([entry.clone()]);
         let mut seen = BTreeSet::new();
         let mut lowered = Vec::new();
+        // Classes whose `<clinit>` must run at startup: JVMS triggers class
+        // initialization on first active use (a static call, `new`, or static
+        // field access). We over-approximate to "any actively-used class with a
+        // `<clinit>`, batched at process start" per P2.4's simplest-correct v1.
+        let mut clinit_classes = BTreeSet::new();
+        // Invoking the entry (a static method) is itself an active use of its
+        // declaring class.
+        self.consider_class_init(&entry.class, &mut clinit_classes, &mut queue);
 
         while let Some(method_key) = queue.pop_front() {
             if !seen.insert(method_key.clone()) {
@@ -128,6 +148,12 @@ impl CompilerPipeline {
             if lowered.is_empty() {
                 require_entry_return_method(&ir)?;
             }
+            // Any actively-used closed-world class needs its `<clinit>` scheduled
+            // (and compiled). `<clinit>` bodies are walked the same way, so their
+            // own dependencies are pulled in transitively.
+            for class in referenced_app_classes(&ir) {
+                self.consider_class_init(&class, &mut clinit_classes, &mut queue);
+            }
             for call in direct_static_calls(&ir) {
                 if self.world.classes.contains_key(&call.class) {
                     queue.push_back(MethodKey::new(&call.class, &call.name, &call.descriptor));
@@ -144,8 +170,97 @@ impl CompilerPipeline {
             lowered.push(ir);
         }
 
-        Ok(lowered)
+        let clinit_symbols = clinit_run_order(&clinit_classes, &lowered);
+        Ok(LoweredClosure {
+            functions: lowered,
+            clinit_symbols,
+        })
     }
+
+    /// Schedule `class`'s `<clinit>` for compilation and startup execution if the
+    /// class is in the closed world, declares a `<clinit>()V`, and we have not
+    /// already scheduled it.
+    fn consider_class_init(
+        &self,
+        class: &str,
+        clinit_classes: &mut BTreeSet<String>,
+        queue: &mut VecDeque<MethodKey>,
+    ) {
+        if !self.class_has_clinit(class) || !clinit_classes.insert(class.to_string()) {
+            return;
+        }
+        queue.push_back(MethodKey::new(class, CLINIT_NAME, CLINIT_DESCRIPTOR));
+    }
+
+    fn class_has_clinit(&self, class: &str) -> bool {
+        self.world.classes.get(class).is_some_and(|class_file| {
+            class_file
+                .methods
+                .iter()
+                .any(|method| method.name == CLINIT_NAME && method.descriptor == CLINIT_DESCRIPTOR)
+        })
+    }
+}
+
+/// Order the needed class initializers so that a class runs after every other
+/// initialized class it actively uses (dependencies first) — the closest a
+/// batch-at-startup scheme gets to JVMS's lazy interleaving. Ties and cycles are
+/// broken by sorted class name for determinism. Returns each class's `<clinit>`
+/// linkage symbol in run order.
+fn clinit_run_order(clinit_classes: &BTreeSet<String>, lowered: &[FunctionIr]) -> Vec<String> {
+    let clinit_by_class: BTreeMap<&str, &FunctionIr> = lowered
+        .iter()
+        .filter_map(|function| {
+            let class = function.name.strip_suffix(&format!(".{CLINIT_NAME}"))?;
+            (function.descriptor == CLINIT_DESCRIPTOR).then_some((class, function))
+        })
+        .collect();
+
+    let mut order = Vec::new();
+    let mut visited = BTreeSet::new();
+    for class in clinit_classes {
+        let dotted = class.replace('/', ".");
+        visit_clinit(
+            &dotted,
+            clinit_classes,
+            &clinit_by_class,
+            &mut visited,
+            &mut order,
+        );
+    }
+    order
+        .into_iter()
+        .map(|dotted| exported_symbol(&format!("{dotted}.{CLINIT_NAME}"), CLINIT_DESCRIPTOR))
+        .collect()
+}
+
+/// Depth-first post-order over the class-init dependency graph. `class` is the
+/// dotted class name; `order` accumulates dotted names dependencies-first. The
+/// `visited` guard makes cycles terminate (an arbitrary-but-stable break).
+fn visit_clinit(
+    class: &str,
+    clinit_classes: &BTreeSet<String>,
+    clinit_by_class: &BTreeMap<&str, &FunctionIr>,
+    visited: &mut BTreeSet<String>,
+    order: &mut Vec<String>,
+) {
+    if !visited.insert(class.to_string()) {
+        return;
+    }
+    if let Some(function) = clinit_by_class.get(class) {
+        // Dependencies of this initializer: other initialized classes it uses.
+        let mut dependencies: Vec<String> = referenced_app_classes(function)
+            .into_iter()
+            .map(|referenced| referenced.replace('/', "."))
+            .filter(|dotted| dotted != class && clinit_classes.contains(&dotted.replace('.', "/")))
+            .collect();
+        dependencies.sort();
+        dependencies.dedup();
+        for dependency in dependencies {
+            visit_clinit(&dependency, clinit_classes, clinit_by_class, visited, order);
+        }
+    }
+    order.push(class.to_string());
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -178,6 +293,8 @@ fn require_entry_return_method(function: &FunctionIr) -> Result<()> {
         IrType::Int
         | IrType::Void
         | IrType::Boolean
+        | IrType::Byte
+        | IrType::Short
         | IrType::Char
         | IrType::Object(_)
         | IrType::Array(_)
@@ -215,4 +332,25 @@ fn direct_static_calls(function: &FunctionIr) -> Vec<MethodRef> {
         }
     }
     calls
+}
+
+/// Classes actively used by a function's body: static-call targets, `new`
+/// targets, and static-field owners (`getstatic`/`putstatic`, i.e. field access
+/// with no receiver). These are exactly the uses that trigger class
+/// initialization under JVMS. Names are in JVM internal (slash) form.
+fn referenced_app_classes(function: &FunctionIr) -> Vec<String> {
+    let mut classes = Vec::new();
+    for block in &function.blocks {
+        for instr in &block.instrs {
+            match instr {
+                IrInstr::Call(_, method, _) => classes.push(method.class.clone()),
+                IrInstr::NewObject(_, class) => classes.push(class.clone()),
+                IrInstr::FieldGet(_, field, None) | IrInstr::FieldPut(field, None, _) => {
+                    classes.push(field.class.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    classes
 }

@@ -24,6 +24,7 @@ fn link_cranelift_object_with_runtime_stub_runs_native_executable() -> anyhow::R
         object_bytes: &object,
         entry_symbol: "fvm_aot_main_28_29I",
         entry_return: EntryReturn::Int,
+        clinit_symbols: &[],
         output_path: &executable_path,
     })?;
 
@@ -51,6 +52,7 @@ fn link_reports_missing_configured_cc() -> anyhow::Result<()> {
         object_bytes: &object,
         entry_symbol: "fvm_aot_main_28_29I",
         entry_return: EntryReturn::Int,
+        clinit_symbols: &[],
         output_path: &executable_path,
     })
     .unwrap_err()

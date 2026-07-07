@@ -11,7 +11,8 @@ use super::bytecode::{
 };
 use super::calls::{
     CallLowering, lower_getfield, lower_getstatic, lower_invokedynamic, lower_invokespecial,
-    lower_invokestatic, lower_invokevirtual, lower_new, lower_putfield, push_ldc_constant,
+    lower_invokestatic, lower_invokevirtual, lower_new, lower_putfield, lower_putstatic,
+    push_ldc_constant,
 };
 use super::metadata::{ir_name, ir_type_for_jvm, method_label};
 use super::state::{BlockEntry, LowerState};
@@ -256,8 +257,10 @@ impl<'a> MethodLowerer<'a> {
             }
             0x2e => self.state.push_array_load(IrType::Int)?,
             0x32 => self.state.push_reference_array_load()?,
+            0x33..=0x35 => self.state.push_subword_array_load()?,
             0x4f => self.state.store_array_store(IrType::Int)?,
             0x53 => self.state.store_reference_array_store()?,
+            0x54..=0x56 => self.state.store_subword_array_store()?,
             0xbe => self.state.push_array_length()?,
             0xbd => {
                 let component = self
@@ -274,9 +277,13 @@ impl<'a> MethodLowerer<'a> {
             0xbc => {
                 let atype = read_u8(&self.code.bytes, &mut self.pc)?;
                 let element = match atype {
+                    4 => IrType::Boolean,
+                    5 => IrType::Char,
+                    8 => IrType::Byte,
+                    9 => IrType::Short,
                     10 => IrType::Int,
                     other => bail!(
-                        "fvm-aot lowerer only supports int arrays (newarray atype 10) today, got atype {other} in {}; required feature: primitive arrays; planned milestone: primitive-completeness",
+                        "fvm-aot lowerer supports boolean/char/byte/short/int arrays only, got newarray atype {other} in {}; required feature: long/float/double arrays; planned milestone: primitive-completeness",
                         self.method_label
                     ),
                 };
@@ -290,12 +297,25 @@ impl<'a> MethodLowerer<'a> {
             0xc4 => self.lower_wide()?,
             0xbb => lower_new(&mut self.call_lowering())?,
             0xb2 => lower_getstatic(&mut self.call_lowering())?,
+            0xb3 => lower_putstatic(&mut self.call_lowering())?,
             0xb4 => lower_getfield(&mut self.call_lowering())?,
             0xb5 => lower_putfield(&mut self.call_lowering())?,
             0xb6 => lower_invokevirtual(&mut self.call_lowering())?,
             0xb7 => lower_invokespecial(&mut self.call_lowering())?,
             0xb8 => lower_invokestatic(&mut self.call_lowering())?,
             0xba => lower_invokedynamic(&mut self.call_lowering())?,
+            0xc0 => {
+                let target = self
+                    .class_file
+                    .class_name(read_u16(&self.code.bytes, &mut self.pc)?)?;
+                self.state.check_cast(target)?;
+            }
+            0xc1 => {
+                let target = self
+                    .class_file
+                    .class_name(read_u16(&self.code.bytes, &mut self.pc)?)?;
+                self.state.push_instance_of(target)?;
+            }
             0xac | 0xb0 | 0xb1 => {
                 let value = if opcode == 0xb1 {
                     None

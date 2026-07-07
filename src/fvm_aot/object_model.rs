@@ -40,12 +40,27 @@ pub(in crate::fvm_aot) struct FieldSlot {
 pub(in crate::fvm_aot) struct ClassLayout {
     pub(in crate::fvm_aot) class_id: u32,
     pub(in crate::fvm_aot) instance_size: u32,
+    /// Total bytes of per-class static storage (0 when the class declares no
+    /// supported static fields). The storage block is a zero-initialized data
+    /// object addressed by `static_field` offsets.
+    pub(in crate::fvm_aot) static_size: u32,
+    /// The superclass's internal name (`None` only for `java/lang/Object`, which
+    /// is not itself a modeled class). Drives `instanceof`/`checkcast` subtype
+    /// resolution.
+    super_name: Option<String>,
+    is_interface: bool,
     fields: BTreeMap<String, FieldSlot>,
+    static_fields: BTreeMap<String, FieldSlot>,
 }
 
 impl ClassLayout {
     pub(in crate::fvm_aot) fn field(&self, name: &str) -> Option<&FieldSlot> {
         self.fields.get(name)
+    }
+
+    /// Offset + type of a static field within this class's static storage block.
+    pub(in crate::fvm_aot) fn static_field(&self, name: &str) -> Option<&FieldSlot> {
+        self.static_fields.get(name)
     }
 }
 
@@ -81,6 +96,71 @@ impl ObjectModel {
     pub(in crate::fvm_aot) fn class(&self, name: &str) -> Option<&ClassLayout> {
         self.classes.get(name)
     }
+
+    /// Every class layout, in deterministic (sorted-name) order. Codegen walks
+    /// this to allocate static storage for classes that declare static fields.
+    pub(in crate::fvm_aot) fn classes(&self) -> impl Iterator<Item = (&String, &ClassLayout)> {
+        self.classes.iter()
+    }
+
+    /// Resolve an `instanceof`/`checkcast` target class to how the runtime type
+    /// check should be performed against the closed-world hierarchy.
+    pub(in crate::fvm_aot) fn subtype_check(&self, target: &str) -> SubtypeCheck {
+        // Every non-null reference is an `Object`; no class-id comparison needed.
+        if target == "java/lang/Object" {
+            return SubtypeCheck::AnyReference;
+        }
+        match self.classes.get(target) {
+            None => SubtypeCheck::Unsupported(format!(
+                "instanceof/checkcast target {target} is not a closed-world class (JDK classes, arrays, and strings are not modeled yet)"
+            )),
+            Some(layout) if layout.is_interface => SubtypeCheck::Unsupported(format!(
+                "instanceof/checkcast target {target} is an interface; interface type checks need itable metadata"
+            )),
+            Some(_) => {
+                // A class D matches `target` iff `target` is D itself or an
+                // ancestor on D's superclass chain. With only single inheritance
+                // modeled, the chain is short; this generalizes automatically as
+                // deeper hierarchies become supported.
+                let mut ids: Vec<u32> = self
+                    .classes
+                    .iter()
+                    .filter(|(_, layout)| !layout.is_interface)
+                    .filter(|(name, _)| self.is_subclass_of(name, target))
+                    .map(|(_, layout)| layout.class_id)
+                    .collect();
+                ids.sort_unstable();
+                SubtypeCheck::ClassIds(ids)
+            }
+        }
+    }
+
+    /// Whether `class` is `target` or transitively extends it, walking the
+    /// modeled superclass chain (terminating at `java/lang/Object`, which is not
+    /// itself a modeled class).
+    fn is_subclass_of(&self, class: &str, target: &str) -> bool {
+        let mut current = class;
+        loop {
+            if current == target {
+                return true;
+            }
+            match self.classes.get(current).and_then(|l| l.super_name.as_deref()) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+    }
+}
+
+/// How a runtime `instanceof`/`checkcast` against a target type is performed.
+pub(in crate::fvm_aot) enum SubtypeCheck {
+    /// The target is `java/lang/Object`: any non-null reference matches.
+    AnyReference,
+    /// The object matches iff its header class id is one of these (the target
+    /// class and its modeled subclasses).
+    ClassIds(Vec<u32>),
+    /// The target type is not modeled yet; reject loudly with this reason.
+    Unsupported(String),
 }
 
 fn layout_class(class_file: &ClassFile, class_id: u32) -> Result<ClassLayout> {
@@ -94,9 +174,27 @@ fn layout_class(class_file: &ClassFile, class_id: u32) -> Result<ClassLayout> {
 
     let mut offset = OBJECT_HEADER_BYTES;
     let mut fields = BTreeMap::new();
+    let mut static_offset = 0;
+    let mut static_fields = BTreeMap::new();
     for field in &class_file.fields {
         if field.access_flags & ACC_STATIC != 0 {
-            continue; // static fields live in per-class storage, not the instance
+            // Static fields live in a per-class storage block, not the instance.
+            // Unsupported widths (long/float/double, P2.7) are omitted rather
+            // than failing the whole layout: a class with an unused wide static
+            // must still compile. Accessing an omitted field fails loudly in
+            // codegen (`static_field` returns `None`).
+            if let Ok((ty, size)) = field_type(&field.descriptor, &class_file.this_name) {
+                static_offset = align_up(static_offset, size);
+                static_fields.insert(
+                    field.name.clone(),
+                    FieldSlot {
+                        offset: static_offset,
+                        ty,
+                    },
+                );
+                static_offset += size;
+            }
+            continue;
         }
         let (ty, size) = field_type(&field.descriptor, &class_file.this_name)?;
         offset = align_up(offset, size);
@@ -107,7 +205,11 @@ fn layout_class(class_file: &ClassFile, class_id: u32) -> Result<ClassLayout> {
     Ok(ClassLayout {
         class_id,
         instance_size: align_up(offset, REFERENCE_BYTES),
+        static_size: align_up(static_offset, REFERENCE_BYTES),
+        super_name: class_file.super_name.clone(),
+        is_interface: class_file.is_interface(),
         fields,
+        static_fields,
     })
 }
 

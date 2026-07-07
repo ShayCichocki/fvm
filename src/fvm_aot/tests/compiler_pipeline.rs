@@ -843,6 +843,241 @@ fn cranelift_object_new_fields_and_constructor_match_hotspot() -> Result<()> {
 }
 
 #[test]
+fn cranelift_subword_arrays_match_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // Sub-word arrays: byte/short pack narrow and sign-extend on load; char/
+    // boolean zero-extend; every store truncates to the element width. Values
+    // out of each type's range exercise the narrowing, and a rolling hash makes
+    // the single returned int sensitive to any divergence from HotSpot.
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotSubwordArrays.java",
+        contents: r#"public final class AotSubwordArrays {
+    static int entry() {
+        int acc = 0;
+
+        byte[] b = new byte[4];
+        b[0] = (byte) 200;              // -> -56 (sign-extended on load)
+        b[1] = 127;
+        b[2] = (byte) -1;
+        b[3] = (byte) (b[0] + b[1]);
+        for (int i = 0; i < b.length; i++) acc = acc * 31 + b[i];
+
+        char[] c = new char[3];
+        c[0] = 'A';
+        c[1] = (char) 65535;            // zero-extended -> 65535
+        c[2] = (char) 70000;            // truncated -> 4464
+        for (int i = 0; i < c.length; i++) acc = acc * 31 + c[i];
+
+        short[] s = new short[3];
+        s[0] = (short) 40000;           // -> -25536
+        s[1] = -1;
+        s[2] = (short) (s[0] - 1);
+        for (int i = 0; i < s.length; i++) acc = acc * 31 + s[i];
+
+        boolean[] z = new boolean[2];
+        z[0] = true;
+        z[1] = false;
+        acc = acc * 31 + (z[0] ? 1 : 0);
+        acc = acc * 31 + (z[1] ? 1 : 0);
+        acc = acc * 31 + z.length;
+
+        return acc;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(entry());
+    }
+}
+"#,
+    }])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-subword-arrays.jar",
+            main_class: "AotSubwordArrays",
+            entries: &[ClassEntry {
+                jar_entry: "AotSubwordArrays.class",
+                class_relative_path: "AotSubwordArrays.class",
+            }],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotSubwordArrays")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected_stdout = hotspot.stdout;
+
+    let native = CompilerPipeline::from_jar(&jar, "AotSubwordArrays")?.compile_static_int_method(
+        &StaticIntMethodSpec {
+            class: "AotSubwordArrays",
+            name: "entry",
+            descriptor: "()I",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-subword-arrays-native"),
+        },
+    )?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, expected_stdout);
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cranelift_static_fields_match_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // Application static fields: `<clinit>` installs the initial values
+    // (putstatic of the field initializers), `bump` reads and writes them
+    // (getstatic/putstatic in a helper), and `entry` reads the final value —
+    // all against per-class static storage executing at runtime.
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotStatics.java",
+        contents: r#"public final class AotStatics {
+    static int counter = 100;
+    static int step = 5;
+
+    static void bump() {
+        counter += step;
+    }
+
+    static int entry() {
+        bump();
+        bump();
+        bump();
+        return counter;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(entry());
+    }
+}
+"#,
+    }])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-statics.jar",
+            main_class: "AotStatics",
+            entries: &[ClassEntry {
+                jar_entry: "AotStatics.class",
+                class_relative_path: "AotStatics.class",
+            }],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotStatics")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected_stdout = hotspot.stdout;
+    assert_eq!(
+        String::from_utf8_lossy(&expected_stdout).trim(),
+        "115",
+        "sanity: 100 + 3*5"
+    );
+
+    let native = CompilerPipeline::from_jar(&jar, "AotStatics")?.compile_static_int_method(
+        &StaticIntMethodSpec {
+            class: "AotStatics",
+            name: "entry",
+            descriptor: "()I",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-statics-native"),
+        },
+    )?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, expected_stdout);
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cranelift_cross_class_static_init_matches_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // Cross-class static initialization order is *observable*: `AotStaticInit`'s
+    // `<clinit>` reads `Config.scaled`, which only holds its computed value once
+    // `Config`'s `<clinit>` has run. If the initializers ran in the wrong order,
+    // `Config.scaled` would still be 0 and `total` would be 5 (→ 15), not 35
+    // (→ 45). This pins the dependency ordering against HotSpot's lazy init.
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[
+        JavaSource {
+            relative_path: "Config.java",
+            contents: r#"final class Config {
+    static int seed = 10;
+    static int scaled = seed * 3;
+}
+"#,
+        },
+        JavaSource {
+            relative_path: "AotStaticInit.java",
+            contents: r#"public final class AotStaticInit {
+    static int total = Config.scaled + 5;
+
+    static int entry() {
+        return total + Config.seed;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(entry());
+    }
+}
+"#,
+        },
+    ])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-static-init.jar",
+            main_class: "AotStaticInit",
+            entries: &[
+                ClassEntry {
+                    jar_entry: "AotStaticInit.class",
+                    class_relative_path: "AotStaticInit.class",
+                },
+                ClassEntry {
+                    jar_entry: "Config.class",
+                    class_relative_path: "Config.class",
+                },
+            ],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotStaticInit")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected_stdout = hotspot.stdout;
+    assert_eq!(
+        String::from_utf8_lossy(&expected_stdout).trim(),
+        "45",
+        "sanity: (10*3 + 5) + 10"
+    );
+
+    let native = CompilerPipeline::from_jar(&jar, "AotStaticInit")?.compile_static_int_method(
+        &StaticIntMethodSpec {
+            class: "AotStaticInit",
+            name: "entry",
+            descriptor: "()I",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-static-init-native"),
+        },
+    )?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, expected_stdout);
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
 fn cranelift_int_edge_case_corpus_matches_hotspot() -> Result<()> {
     if skip_missing_toolchain() {
         return Ok(());

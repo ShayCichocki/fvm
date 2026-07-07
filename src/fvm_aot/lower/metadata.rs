@@ -24,7 +24,7 @@ pub(super) fn ir_type_for_jvm(ty: &JvmType, role: &str, method_label: &str) -> R
         JvmType::Void => Ok(IrType::Void),
         JvmType::String => Ok(IrType::Object("java/lang/String".to_string())),
         JvmType::Object(class) => Ok(IrType::Object(class.clone())),
-        JvmType::Array(descriptor) => Ok(IrType::Array(Box::new(ir_type_for_descriptor(
+        JvmType::Array(descriptor) => Ok(IrType::Array(Box::new(array_component_ir_type(
             array_component_descriptor(descriptor)?,
         )?))),
         JvmType::Unsupported => bail!(
@@ -44,6 +44,17 @@ pub(super) fn field_ir_type(descriptor: &str, method_label: &str) -> Result<IrTy
         );
     }
     Ok(ty)
+}
+
+/// An array component keeps its narrow storage width: `byte`/`short` stay
+/// distinct from `int` (unlike scalar fields, which widen). Everything else
+/// resolves as a normal descriptor.
+fn array_component_ir_type(descriptor: &str) -> Result<IrType> {
+    match descriptor {
+        "B" => Ok(IrType::Byte),
+        "S" => Ok(IrType::Short),
+        _ => ir_type_for_descriptor(descriptor),
+    }
 }
 
 fn ir_type_for_descriptor(descriptor: &str) -> Result<IrType> {

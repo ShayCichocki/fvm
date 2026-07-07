@@ -164,7 +164,14 @@ impl<'a> Verifier<'a> {
                 self.scope.use_value(block, *array)?;
                 self.scope.require_int_like(block, *index)?;
                 self.verify_type("array element type", element)?;
-                self.define_value(*value, element.clone(), false)
+                // Sub-word loads (`baload`/`caload`/`saload`) widen to `int` on
+                // the operand stack; reference loads keep the element type.
+                let loaded = if element.is_int_like() {
+                    IrType::Int
+                } else {
+                    element.clone()
+                };
+                self.define_value(*value, loaded, false)
             }
             IrInstr::ArrayStore(array, index, value, element) => {
                 self.scope.use_value(block, *array)?;

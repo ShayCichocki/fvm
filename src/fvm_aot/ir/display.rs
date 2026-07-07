@@ -81,6 +81,8 @@ impl fmt::Display for IrType {
             Self::Void => write!(output, "void"),
             Self::Int => write!(output, "int"),
             Self::Boolean => write!(output, "boolean"),
+            Self::Byte => write!(output, "byte"),
+            Self::Short => write!(output, "short"),
             Self::Char => write!(output, "char"),
             Self::Object(class) => write!(output, "ref {class}"),
             Self::Array(component) => write!(output, "array<{component}>"),
