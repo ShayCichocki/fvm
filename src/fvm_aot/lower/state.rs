@@ -1,6 +1,6 @@
 use super::super::ir::{
     FieldRef, IrArithmeticOp, IrCompareOp, IrConst, IrInstr, IrParam, IrType, IrUnaryOp, MethodRef,
-    TrapReason, ValueId,
+    RuntimeHelper, TrapReason, ValueId,
 };
 use anyhow::{Context, Result, bail};
 
@@ -354,6 +354,52 @@ impl LowerState {
         value
     }
 
+    /// Push the sentinel that represents `System.out`. It is never dereferenced
+    /// — the `println`/`print` intrinsic pops it and lowers to a runtime call —
+    /// so a null-valued PrintStream reference is a fine placeholder.
+    pub(super) fn push_stdout(&mut self) {
+        let value = self.emit_constant(IrConst::Null);
+        self.stack.push(TypedValue {
+            value,
+            ty: IrType::Object("java/io/PrintStream".to_string()),
+        });
+    }
+
+    pub(super) fn emit_runtime_call(&mut self, helper: RuntimeHelper, args: Vec<ValueId>) {
+        self.instrs.push(IrInstr::RuntimeCall(None, helper, args));
+    }
+
+    /// Emit a value-producing runtime call, returning its result value without
+    /// pushing it onto the abstract stack (for intermediate builder values).
+    pub(super) fn emit_runtime_value(
+        &mut self,
+        helper: RuntimeHelper,
+        args: Vec<ValueId>,
+        ty: IrType,
+    ) -> ValueId {
+        let value = self.new_value();
+        self.instrs
+            .push(IrInstr::RuntimeCall(Some(value), helper, args));
+        let _ = ty;
+        value
+    }
+
+    /// Emit a String constant, returning its value without pushing it.
+    pub(super) fn emit_string_constant(&mut self, bytes: Vec<u8>) -> ValueId {
+        self.emit_constant(IrConst::String(bytes))
+    }
+
+    /// Push an already-produced value onto the abstract stack with a type.
+    pub(super) fn push_value(&mut self, value: ValueId, ty: IrType) {
+        self.stack.push(TypedValue { value, ty });
+    }
+
+    /// Pop a value together with its tracked static type.
+    pub(super) fn pop_value(&mut self) -> Result<(ValueId, IrType)> {
+        let typed = self.pop_typed()?;
+        Ok((typed.value, typed.ty))
+    }
+
     pub(super) fn push_new_object(&mut self, class: String) {
         let value = self.new_value();
         self.instrs.push(IrInstr::NewObject(value, class.clone()));
@@ -365,6 +411,10 @@ impl LowerState {
 
     pub(super) fn push_field_get(&mut self, field: FieldRef) -> Result<()> {
         let receiver = self.pop_typed()?;
+        self.instrs.push(IrInstr::NullCheck(
+            receiver.value,
+            TrapReason::NullReference,
+        ));
         let value = self.new_value();
         let ty = field.ty.clone();
         self.instrs
@@ -376,6 +426,10 @@ impl LowerState {
     pub(super) fn store_field_put(&mut self, field: FieldRef) -> Result<()> {
         let value = self.pop_typed()?;
         let receiver = self.pop_typed()?;
+        self.instrs.push(IrInstr::NullCheck(
+            receiver.value,
+            TrapReason::NullReference,
+        ));
         self.instrs
             .push(IrInstr::FieldPut(field, Some(receiver.value), value.value));
         Ok(())
@@ -395,6 +449,8 @@ impl LowerState {
 
     pub(super) fn push_array_length(&mut self) -> Result<()> {
         let array = self.pop_stack()?;
+        self.instrs
+            .push(IrInstr::NullCheck(array, TrapReason::NullReference));
         let value = self.new_value();
         self.instrs.push(IrInstr::ArrayLength(value, array));
         self.stack.push(TypedValue {
@@ -407,6 +463,7 @@ impl LowerState {
     pub(super) fn push_array_load(&mut self, element: IrType) -> Result<()> {
         let index = self.pop_stack()?;
         let array = self.pop_stack()?;
+        self.guard_array_access(array, index);
         let value = self.new_value();
         self.instrs
             .push(IrInstr::ArrayLoad(value, array, index, element.clone()));
@@ -418,9 +475,56 @@ impl LowerState {
         let value = self.pop_stack()?;
         let index = self.pop_stack()?;
         let array = self.pop_stack()?;
+        self.guard_array_access(array, index);
         self.instrs
             .push(IrInstr::ArrayStore(array, index, value, element));
         Ok(())
+    }
+
+    /// `aaload`/`aastore` derive the element type from the array's static type
+    /// (the JVM doesn't encode it in the opcode). The array must be a reference
+    /// array.
+    pub(super) fn push_reference_array_load(&mut self) -> Result<()> {
+        let index = self.pop_stack()?;
+        let array = self.pop_typed()?;
+        let element = reference_array_element(&array.ty)?;
+        self.guard_array_access(array.value, index);
+        let value = self.new_value();
+        self.instrs.push(IrInstr::ArrayLoad(
+            value,
+            array.value,
+            index,
+            element.clone(),
+        ));
+        self.stack.push(TypedValue { value, ty: element });
+        Ok(())
+    }
+
+    pub(super) fn store_reference_array_store(&mut self) -> Result<()> {
+        let value = self.pop_typed()?;
+        let index = self.pop_stack()?;
+        let array = self.pop_typed()?;
+        let element = reference_array_element(&array.ty)?;
+        self.guard_array_access(array.value, index);
+        self.instrs.push(IrInstr::ArrayStore(
+            array.value,
+            index,
+            value.value,
+            element,
+        ));
+        Ok(())
+    }
+
+    /// Emit the null check and bounds check that guard every array element
+    /// access: the array must be non-null, and the index must fall within the
+    /// length loaded via `ArrayLength`.
+    fn guard_array_access(&mut self, array: ValueId, index: ValueId) {
+        self.instrs
+            .push(IrInstr::NullCheck(array, TrapReason::NullReference));
+        let length = self.new_value();
+        self.instrs.push(IrInstr::ArrayLength(length, array));
+        self.instrs
+            .push(IrInstr::BoundsCheck(index, length, TrapReason::Bounds));
     }
 
     pub(super) fn push_static_call(
@@ -462,6 +566,13 @@ impl LowerState {
         let value = ValueId::new(self.next_value);
         self.next_value += 1;
         value
+    }
+}
+
+fn reference_array_element(array_ty: &IrType) -> Result<IrType> {
+    match array_ty {
+        IrType::Array(component) => Ok((**component).clone()),
+        other => bail!("fvm-aot lowerer reference array access on non-array type {other}"),
     }
 }
 

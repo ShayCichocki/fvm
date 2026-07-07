@@ -398,6 +398,309 @@ fn cranelift_shifts_bitwise_and_conversions_match_hotspot() -> Result<()> {
 }
 
 #[test]
+fn cranelift_reference_arrays_match_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // A reference array of app objects: `anewarray`, `aastore` object refs,
+    // `aaload` them back, and read a field through each — exercised at runtime.
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[
+        JavaSource {
+            relative_path: "Node.java",
+            contents: r#"final class Node {
+    int v;
+
+    Node(int v) {
+        this.v = v;
+    }
+}
+"#,
+        },
+        JavaSource {
+            relative_path: "AotRefArrays.java",
+            contents: r#"public final class AotRefArrays {
+    static int entry() {
+        Node[] ns = new Node[3];
+        ns[0] = new Node(10);
+        ns[1] = new Node(20);
+        ns[2] = new Node(30);
+        int sum = 0;
+        for (int i = 0; i < ns.length; i++) {
+            sum += ns[i].v;
+        }
+        return sum;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(entry());
+    }
+}
+"#,
+        },
+    ])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-ref-arrays.jar",
+            main_class: "AotRefArrays",
+            entries: &[
+                ClassEntry {
+                    jar_entry: "AotRefArrays.class",
+                    class_relative_path: "AotRefArrays.class",
+                },
+                ClassEntry {
+                    jar_entry: "Node.class",
+                    class_relative_path: "Node.class",
+                },
+            ],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotRefArrays")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected_stdout = hotspot.stdout;
+
+    let native = CompilerPipeline::from_jar(&jar, "AotRefArrays")?.compile_static_int_method(
+        &StaticIntMethodSpec {
+            class: "AotRefArrays",
+            name: "entry",
+            descriptor: "()I",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-ref-arrays-native"),
+        },
+    )?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, expected_stdout);
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cranelift_null_and_bounds_traps_match_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // Each fixture triggers a runtime trap. HotSpot exits 1 with the exception
+    // on stderr; the compiled binary must do the same (deterministic exit +
+    // Java-shaped message) via the branch-to-runtime-helper trap mechanism.
+    struct Trap {
+        name: &'static str,
+        body: &'static str,
+        exception: &'static str,
+    }
+    let traps = [
+        Trap {
+            name: "AotNpe",
+            body: "int[] a = maybeNull(); return a.length;",
+            exception: "java.lang.NullPointerException",
+        },
+        Trap {
+            name: "AotOob",
+            body: "int[] a = new int[3]; return a[index()];",
+            exception: "java.lang.ArrayIndexOutOfBoundsException",
+        },
+        Trap {
+            name: "AotNeg",
+            body: "int[] a = new int[negativeSize()]; return a.length;",
+            exception: "java.lang.NegativeArraySizeException",
+        },
+    ];
+
+    for trap in traps {
+        let fixture = AotFixture::new()?;
+        let source = format!(
+            "public final class {name} {{\n\
+             \x20   static int[] maybeNull() {{ return null; }}\n\
+             \x20   static int index() {{ return 7; }}\n\
+             \x20   static int negativeSize() {{ return -1; }}\n\
+             \x20   static int entry() {{ {body} }}\n\
+             \x20   public static void main(String[] args) {{ System.out.println(entry()); }}\n\
+             }}\n",
+            name = trap.name,
+            body = trap.body,
+        );
+        let classes = fixture.compile_sources(&[JavaSource {
+            relative_path: &format!("{}.java", trap.name),
+            contents: &source,
+        }])?;
+        let jar = fixture.package_jar(
+            &classes,
+            JarSpec {
+                jar_name: "trap.jar",
+                main_class: trap.name,
+                entries: &[ClassEntry {
+                    jar_entry: &format!("{}.class", trap.name),
+                    class_relative_path: &format!("{}.class", trap.name),
+                }],
+            },
+        )?;
+        let hotspot = run_hotspot(&classes, trap.name)?;
+        assert_eq!(hotspot.status.code(), Some(1), "{}: {hotspot:?}", trap.name);
+
+        let native = CompilerPipeline::from_jar(&jar, trap.name)?.compile_static_int_method(
+            &StaticIntMethodSpec {
+                class: trap.name,
+                name: "entry",
+                descriptor: "()I",
+                cc: "cc",
+                output_path: &fixture.artifact_path(&format!("{}-native", trap.name)),
+            },
+        )?;
+        let output = Command::new(native.path()).output()?;
+
+        assert_eq!(output.status.code(), Some(1), "{}", trap.name);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(trap.exception),
+            "{} stderr missing {}: {stderr}",
+            trap.name,
+            trap.exception
+        );
+        assert!(output.stdout.is_empty(), "{}", trap.name);
+    }
+    Ok(())
+}
+
+#[test]
+fn cranelift_string_concat_matches_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // `+` on strings compiles to a StringConcatFactory invokedynamic; the recipe
+    // interleaves literal text with dynamic int/String arguments. This is what
+    // makes `println("Result: " + compute())` work.
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotConcat.java",
+        contents: r#"public final class AotConcat {
+    static int compute() {
+        return 6 * 7;
+    }
+
+    static String label(int n) {
+        return "n=" + n + " (squared " + (n * n) + ")";
+    }
+
+    static void run() {
+        String who = "world";
+        System.out.println("Hello, " + who + "!");
+        System.out.println("The answer is " + compute());
+        System.out.println(label(9));
+        System.out.println(label(9) + " and " + label(2));
+    }
+
+    public static void main(String[] args) {
+        run();
+    }
+}
+"#,
+    }])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-concat.jar",
+            main_class: "AotConcat",
+            entries: &[ClassEntry {
+                jar_entry: "AotConcat.class",
+                class_relative_path: "AotConcat.class",
+            }],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotConcat")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected_stdout = hotspot.stdout;
+
+    let native = CompilerPipeline::from_jar(&jar, "AotConcat")?.compile_static_int_method(
+        &StaticIntMethodSpec {
+            class: "AotConcat",
+            name: "run",
+            descriptor: "()V",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-concat-native"),
+        },
+    )?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, expected_stdout);
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
+fn cranelift_println_hello_world_matches_hotspot() -> Result<()> {
+    if skip_missing_toolchain() {
+        return Ok(());
+    }
+
+    // The first program that actually *says* something: string literals, int
+    // printing, print-without-newline, an empty println, and a static call —
+    // all through the `System.out.print/println` intrinsic path, void entry.
+    let fixture = AotFixture::new()?;
+    let classes = fixture.compile_sources(&[JavaSource {
+        relative_path: "AotHello.java",
+        contents: r#"public final class AotHello {
+    static int square(int x) {
+        return x * x;
+    }
+
+    static void run() {
+        System.out.println("Hello, fvm!");
+        System.out.print("2 + 2 = ");
+        System.out.println(2 + 2);
+        System.out.println(square(7));
+        System.out.println();
+        System.out.println("done");
+    }
+
+    public static void main(String[] args) {
+        run();
+    }
+}
+"#,
+    }])?;
+    let jar = fixture.package_jar(
+        &classes,
+        JarSpec {
+            jar_name: "cranelift-hello.jar",
+            main_class: "AotHello",
+            entries: &[ClassEntry {
+                jar_entry: "AotHello.class",
+                class_relative_path: "AotHello.class",
+            }],
+        },
+    )?;
+    let hotspot = run_hotspot(&classes, "AotHello")?;
+    assert!(hotspot.status.success(), "HotSpot failed: {hotspot:?}");
+    let expected_stdout = hotspot.stdout;
+    assert!(
+        String::from_utf8_lossy(&expected_stdout).contains("Hello, fvm!"),
+        "sanity: HotSpot printed the greeting"
+    );
+
+    let native = CompilerPipeline::from_jar(&jar, "AotHello")?.compile_static_int_method(
+        &StaticIntMethodSpec {
+            class: "AotHello",
+            name: "run",
+            descriptor: "()V",
+            cc: "cc",
+            output_path: &fixture.artifact_path("cranelift-hello-native"),
+        },
+    )?;
+    let output = Command::new(native.path()).output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, expected_stdout);
+    assert!(output.stderr.is_empty());
+    Ok(())
+}
+
+#[test]
 fn cranelift_int_arrays_match_hotspot() -> Result<()> {
     if skip_missing_toolchain() {
         return Ok(());

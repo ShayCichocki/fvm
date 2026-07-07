@@ -121,11 +121,12 @@ impl CompilerPipeline {
                 })?;
             let ir = lower_method_to_ir(class_file, method)
                 .with_context(|| format!("phase=lower method={}", method_key.label()))?;
-            // The compiled entry's result is delivered via the int print ABI, so
-            // it must return int; helper methods reached transitively (void
-            // constructors, reference-returning helpers) are unconstrained.
+            // The compiled entry is delivered via the entry ABI: an int result
+            // is printed, a void method just runs (output comes from println
+            // calls). Reference/other returns have no ABI. Helpers reached
+            // transitively are unconstrained.
             if lowered.is_empty() {
-                require_int_return_method(&ir)?;
+                require_entry_return_method(&ir)?;
             }
             for call in direct_static_calls(&ir) {
                 if self.world.classes.contains_key(&call.class) {
@@ -168,13 +169,12 @@ impl MethodKey {
     }
 }
 
-/// The Cranelift path lowers int-returning static methods; control flow
-/// (multiple blocks, loops, branches) is supported as of P1.3. Non-int return
-/// types still await later phases (object/void/long ABIs), so they are rejected
-/// loudly here rather than reaching codegen.
-fn require_int_return_method(function: &FunctionIr) -> Result<()> {
+/// The compiled entry must return `int` (printed) or `void` (runs for its
+/// println side effects). Reference and other returns have no delivery ABI yet,
+/// so they are rejected loudly rather than reaching codegen.
+fn require_entry_return_method(function: &FunctionIr) -> Result<()> {
     match &function.return_type {
-        IrType::Int if !function.blocks.is_empty() => Ok(()),
+        IrType::Int | IrType::Void if !function.blocks.is_empty() => Ok(()),
         IrType::Int
         | IrType::Void
         | IrType::Boolean
@@ -182,7 +182,7 @@ fn require_int_return_method(function: &FunctionIr) -> Result<()> {
         | IrType::Object(_)
         | IrType::Array(_)
         | IrType::Unsupported(_) => bail!(
-            "phase=compiler method={} message=compiler path supports int-returning static methods only",
+            "phase=compiler method={} message=compiler entry must return int or void",
             function.name
         ),
     }

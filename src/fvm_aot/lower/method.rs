@@ -10,8 +10,8 @@ use super::bytecode::{
     read_u8, read_u16,
 };
 use super::calls::{
-    CallLowering, lower_getfield, lower_invokespecial, lower_invokestatic, lower_new,
-    lower_putfield, push_int_constant,
+    CallLowering, lower_getfield, lower_getstatic, lower_invokedynamic, lower_invokespecial,
+    lower_invokestatic, lower_invokevirtual, lower_new, lower_putfield, push_ldc_constant,
 };
 use super::metadata::{ir_name, ir_type_for_jvm, method_label};
 use super::state::{BlockEntry, LowerState};
@@ -200,7 +200,7 @@ impl<'a> MethodLowerer<'a> {
                 } else {
                     read_u16(&self.code.bytes, &mut self.pc)?
                 };
-                push_int_constant(&mut self.call_lowering(), index)?;
+                push_ldc_constant(&mut self.call_lowering(), index)?;
             }
             0x15 | 0x19 | 0x1a..=0x1d | 0x2a..=0x2d => {
                 let index = match opcode {
@@ -255,8 +255,22 @@ impl<'a> MethodLowerer<'a> {
                 self.state.increment_local(index, delta)?;
             }
             0x2e => self.state.push_array_load(IrType::Int)?,
+            0x32 => self.state.push_reference_array_load()?,
             0x4f => self.state.store_array_store(IrType::Int)?,
+            0x53 => self.state.store_reference_array_store()?,
             0xbe => self.state.push_array_length()?,
+            0xbd => {
+                let component = self
+                    .class_file
+                    .class_name(read_u16(&self.code.bytes, &mut self.pc)?)?;
+                if component.starts_with('[') {
+                    bail!(
+                        "fvm-aot lowerer does not support multidimensional arrays (anewarray of {component}) in {}; required feature: multidimensional arrays; planned milestone: primitive-completeness",
+                        self.method_label
+                    );
+                }
+                self.state.push_new_array(IrType::Object(component))?;
+            }
             0xbc => {
                 let atype = read_u8(&self.code.bytes, &mut self.pc)?;
                 let element = match atype {
@@ -275,10 +289,13 @@ impl<'a> MethodLowerer<'a> {
             0xaa | 0xab => return self.lower_switch(opcode_pc),
             0xc4 => self.lower_wide()?,
             0xbb => lower_new(&mut self.call_lowering())?,
+            0xb2 => lower_getstatic(&mut self.call_lowering())?,
             0xb4 => lower_getfield(&mut self.call_lowering())?,
             0xb5 => lower_putfield(&mut self.call_lowering())?,
+            0xb6 => lower_invokevirtual(&mut self.call_lowering())?,
             0xb7 => lower_invokespecial(&mut self.call_lowering())?,
             0xb8 => lower_invokestatic(&mut self.call_lowering())?,
+            0xba => lower_invokedynamic(&mut self.call_lowering())?,
             0xac | 0xb0 | 0xb1 => {
                 let value = if opcode == 0xb1 {
                     None

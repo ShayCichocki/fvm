@@ -13,8 +13,21 @@ pub(super) fn constant_type(constant: &IrConst) -> IrType {
 
 pub(super) fn runtime_return_type(helper: &RuntimeHelper) -> Option<IrType> {
     match helper {
-        RuntimeHelper::Println | RuntimeHelper::HttpRespond => None,
-        RuntimeHelper::StringConcat => Some(IrType::Object("java/lang/String".to_string())),
+        RuntimeHelper::Println
+        | RuntimeHelper::PrintlnInt
+        | RuntimeHelper::PrintlnString
+        | RuntimeHelper::PrintlnEmpty
+        | RuntimeHelper::PrintInt
+        | RuntimeHelper::PrintString
+        | RuntimeHelper::StringBuilderAppendInt
+        | RuntimeHelper::StringBuilderAppendString
+        | RuntimeHelper::HttpRespond => None,
+        RuntimeHelper::StringBuilderNew => {
+            Some(IrType::Object("fvm/runtime/StringBuilder".to_string()))
+        }
+        RuntimeHelper::StringConcat | RuntimeHelper::StringBuilderFinish => {
+            Some(IrType::Object("java/lang/String".to_string()))
+        }
         RuntimeHelper::ArrayClone => Some(IrType::Object("java/lang/Object".to_string())),
         RuntimeHelper::ObjectHashCode => Some(IrType::Int),
     }

@@ -183,6 +183,15 @@ pub(super) struct FieldRef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RuntimeHelper {
     Println,
+    PrintlnInt,
+    PrintlnString,
+    PrintlnEmpty,
+    PrintInt,
+    PrintString,
+    StringBuilderNew,
+    StringBuilderAppendInt,
+    StringBuilderAppendString,
+    StringBuilderFinish,
     HttpRespond,
     StringConcat,
     ArrayClone,

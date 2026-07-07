@@ -5,12 +5,17 @@ use super::error::CodegenError;
 use super::symbols::{function_label, method_label};
 use crate::fvm_aot::ir::{
     BasicBlockId, BranchEdge, FieldRef, FunctionIr, IrArithmeticOp, IrCompareOp, IrConst, IrInstr,
-    IrType, IrUnaryOp, TrapReason, ValueId,
+    IrType, IrUnaryOp, RuntimeHelper, TrapReason, ValueId,
 };
 use crate::fvm_aot::object_model::{
     ARRAY_ELEMENTS_OFFSET, ARRAY_LENGTH_OFFSET, CLASS_ID_OFFSET, ObjectModel, REFERENCE_BYTES,
 };
-use crate::fvm_aot::runtime_stub::{ALLOC_SYMBOL, TRAP_DIVIDE_BY_ZERO_SYMBOL};
+use crate::fvm_aot::runtime_stub::{
+    ALLOC_SYMBOL, PRINT_INT_RAW_SYMBOL, PRINT_INT_SYMBOL, PRINT_STRING_SYMBOL,
+    PRINTLN_EMPTY_SYMBOL, PRINTLN_STRING_SYMBOL, SB_APPEND_INT_SYMBOL, SB_APPEND_STRING_SYMBOL,
+    SB_FINISH_SYMBOL, SB_NEW_SYMBOL, TRAP_BOUNDS_SYMBOL, TRAP_DIVIDE_BY_ZERO_SYMBOL,
+    TRAP_NEGATIVE_ARRAY_SIZE_SYMBOL, TRAP_NULL_SYMBOL,
+};
 use categories::instruction_category;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -18,9 +23,13 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::ir::{InstBuilder, UserFuncName};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::ObjectModule;
 use std::collections::{BTreeMap, HashMap};
+
+/// Interns compiled string literals as read-only data objects so identical
+/// literals share one blob (a small step toward literal interning, P3.1).
+type StringPool = HashMap<Vec<u8>, DataId>;
 
 pub(super) fn emit_functions(
     module: &mut ObjectModule,
@@ -28,8 +37,9 @@ pub(super) fn emit_functions(
     model: &ObjectModel,
 ) -> Result<(), CodegenError> {
     let ids = declare_functions(module, functions)?;
+    let mut strings = StringPool::new();
     for function in functions {
-        emit_function(module, function, &ids, model)?;
+        emit_function(module, function, &ids, model, &mut strings)?;
     }
     Ok(())
 }
@@ -72,6 +82,7 @@ fn emit_function(
     function: &FunctionIr,
     ids: &BTreeMap<String, FuncId>,
     model: &ObjectModel,
+    strings: &mut StringPool,
 ) -> Result<(), CodegenError> {
     let func_id = *ids
         .get(&function_label(function))
@@ -125,6 +136,7 @@ fn emit_function(
                 &clif_blocks,
                 &mut values,
                 model,
+                strings,
                 instr,
             )?;
         }
@@ -150,15 +162,30 @@ fn lower_instr(
     clif_blocks: &HashMap<BasicBlockId, Block>,
     values: &mut HashMap<ValueId, Value>,
     model: &ObjectModel,
+    strings: &mut StringPool,
     instr: &IrInstr,
 ) -> Result<(), CodegenError> {
     match instr {
         IrInstr::Param(..) => Ok(()),
+        IrInstr::Constant(value, IrConst::Null) => {
+            // The null reference is a zero pointer.
+            values.insert(*value, builder.ins().iconst(types::I64, 0));
+            Ok(())
+        }
+        IrInstr::Constant(value, IrConst::String(bytes)) => {
+            let pointer = lower_string_literal(module, builder, function, strings, bytes)?;
+            values.insert(*value, pointer);
+            Ok(())
+        }
         IrInstr::Constant(value, constant) => {
             let constant = clif_const(function, constant)?;
             values.insert(*value, builder.ins().iconst(types::I32, constant));
             Ok(())
         }
+        IrInstr::RuntimeCall(result, helper, args) => {
+            lower_runtime_call(module, builder, function, values, *result, helper, args)
+        }
+
         IrInstr::Compare(value, op, lhs, rhs) => {
             let result = lower_compare(function, builder, values, *op, *lhs, *rhs)?;
             values.insert(*value, result);
@@ -322,6 +349,30 @@ fn lower_instr(
                 .ins()
                 .store(MemFlagsData::trusted(), stored, addr, 0);
             Ok(())
+        }
+        IrInstr::NullCheck(value, _reason) => {
+            let reference = require_value(function, values, *value)?;
+            let null = builder.ins().iconst(types::I64, 0);
+            let is_null = builder.ins().icmp(IntCC::Equal, reference, null);
+            trap_if(module, builder, function, is_null, TRAP_NULL_SYMBOL, &[])
+        }
+        IrInstr::BoundsCheck(index, length, _reason) => {
+            let index = require_value(function, values, *index)?;
+            let length = require_value(function, values, *length)?;
+            // Unsigned compare folds `index < 0` and `index >= length` into one
+            // test: a negative index is a huge unsigned value ≥ length.
+            let out_of_bounds =
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, index, length);
+            trap_if(
+                module,
+                builder,
+                function,
+                out_of_bounds,
+                TRAP_BOUNDS_SYMBOL,
+                &[index, length],
+            )
         }
         IrInstr::FieldGet(_, _, None) | IrInstr::FieldPut(_, None, _) => unsupported(
             function,
@@ -489,18 +540,38 @@ fn lower_zero_check(
         }
     };
     let checked = require_value(function, values, value)?;
+    let zero = builder.ins().iconst(types::I32, 0);
+    let is_zero = builder.ins().icmp(IntCC::Equal, checked, zero);
+    trap_if(module, builder, function, is_zero, symbol, &[])
+}
 
+/// Split the current block so control continues only when `condition` is false;
+/// when true, divert to a runtime abort helper (called with `args`) that prints
+/// a Java-shaped message and exits deterministically. This is the shared trap
+/// mechanism behind divide-by-zero, null, bounds, and negative-array-size
+/// checks — a branch to a runtime helper, not a bare CPU trap.
+fn trap_if(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    function: &FunctionIr,
+    condition: Value,
+    symbol: &str,
+    args: &[Value],
+) -> Result<(), CodegenError> {
     let trap_block = builder.create_block();
     let continue_block = builder.create_block();
-    // Non-zero divisor continues; zero diverts to the abort helper.
     builder
         .ins()
-        .brif(checked, continue_block, &[], trap_block, &[]);
+        .brif(condition, trap_block, &[], continue_block, &[]);
 
     builder.switch_to_block(trap_block);
-    let helper = declare_runtime_helper(module, function, symbol, &[], None)?;
+    let params: Vec<Type> = args
+        .iter()
+        .map(|arg| builder.func.dfg.value_type(*arg))
+        .collect();
+    let helper = declare_runtime_helper(module, function, symbol, &params, None)?;
     let local = module.declare_func_in_func(helper, builder.func);
-    builder.ins().call(local, &[]);
+    builder.ins().call(local, args);
     // The helper never returns; this terminator is unreachable but keeps the
     // block well-formed.
     builder.ins().trap(TrapCode::INTEGER_DIVISION_BY_ZERO);
@@ -532,6 +603,104 @@ fn declare_runtime_helper(
             function: function_label(function),
             message: source.to_string(),
         })
+}
+
+/// Materialize a string literal as a read-only, length-prefixed UTF-8 blob
+/// (`[i32 byte-length][bytes]`) and return a pointer to it. Identical literals
+/// share one blob. This is the minimal self-describing `String` the runtime
+/// print helpers consume; the full heap `String` object grows from it in P3.1.
+fn lower_string_literal(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    function: &FunctionIr,
+    strings: &mut StringPool,
+    bytes: &[u8],
+) -> Result<Value, CodegenError> {
+    let data_id = match strings.get(bytes) {
+        Some(id) => *id,
+        None => {
+            let name = format!("fvm_str_{}", strings.len());
+            let id = module
+                .declare_data(&name, Linkage::Local, false, false)
+                .map_err(|source| backend_message(function, source.to_string()))?;
+            let length = i32::try_from(bytes.len())
+                .map_err(|_| backend_error(function, "string literal exceeds i32 length"))?;
+            let mut blob = Vec::with_capacity(4 + bytes.len());
+            blob.extend_from_slice(&length.to_le_bytes());
+            blob.extend_from_slice(bytes);
+            let mut description = DataDescription::new();
+            description.define(blob.into_boxed_slice());
+            module
+                .define_data(id, &description)
+                .map_err(|source| backend_message(function, source.to_string()))?;
+            strings.insert(bytes.to_vec(), id);
+            id
+        }
+    };
+    let global = module.declare_data_in_func(data_id, builder.func);
+    Ok(builder.ins().symbol_value(types::I64, global))
+}
+
+/// Lower a runtime-library call: the `System.out` print family (void) and the
+/// string-concat builder helpers (`sb_new`/`sb_finish` return a pointer).
+fn lower_runtime_call(
+    module: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    function: &FunctionIr,
+    values: &mut HashMap<ValueId, Value>,
+    result: Option<ValueId>,
+    helper: &RuntimeHelper,
+    args: &[ValueId],
+) -> Result<(), CodegenError> {
+    let (symbol, returns) = match helper {
+        RuntimeHelper::PrintlnInt => (PRINT_INT_SYMBOL, None),
+        RuntimeHelper::PrintInt => (PRINT_INT_RAW_SYMBOL, None),
+        RuntimeHelper::PrintlnString => (PRINTLN_STRING_SYMBOL, None),
+        RuntimeHelper::PrintString => (PRINT_STRING_SYMBOL, None),
+        RuntimeHelper::PrintlnEmpty => (PRINTLN_EMPTY_SYMBOL, None),
+        RuntimeHelper::StringBuilderNew => (SB_NEW_SYMBOL, Some(types::I64)),
+        RuntimeHelper::StringBuilderAppendInt => (SB_APPEND_INT_SYMBOL, None),
+        RuntimeHelper::StringBuilderAppendString => (SB_APPEND_STRING_SYMBOL, None),
+        RuntimeHelper::StringBuilderFinish => (SB_FINISH_SYMBOL, Some(types::I64)),
+        RuntimeHelper::Println
+        | RuntimeHelper::HttpRespond
+        | RuntimeHelper::StringConcat
+        | RuntimeHelper::ArrayClone
+        | RuntimeHelper::ObjectHashCode => {
+            return unsupported(
+                function,
+                "RuntimeCall",
+                "only the print and string-concat runtime helpers are compiled today",
+            );
+        }
+    };
+    if result.is_some() != returns.is_some() {
+        return unsupported(
+            function,
+            "RuntimeCall",
+            "runtime helper result arity does not match its signature",
+        );
+    }
+    let arg_values = args
+        .iter()
+        .map(|arg| require_value(function, values, *arg))
+        .collect::<Result<Vec<_>, _>>()?;
+    let param_types: Vec<Type> = arg_values
+        .iter()
+        .map(|value| builder.func.dfg.value_type(*value))
+        .collect();
+    let helper_id = declare_runtime_helper(module, function, symbol, &param_types, returns)?;
+    let local = module.declare_func_in_func(helper_id, builder.func);
+    let call = builder.ins().call(local, &arg_values);
+    if let Some(result) = result {
+        let value = builder
+            .inst_results(call)
+            .first()
+            .copied()
+            .ok_or_else(|| backend_error(function, "runtime helper returned no value"))?;
+        values.insert(result, value);
+    }
+    Ok(())
 }
 
 /// Allocate an object: call `fvm_rt_alloc(instance_size)` for zeroed memory and
@@ -589,7 +758,18 @@ fn lower_new_array(
     length: Value,
 ) -> Result<Value, CodegenError> {
     let stride = element_stride(function, element)?;
-    // length is a non-negative int; widen to i64 for the size arithmetic.
+    // Java throws NegativeArraySizeException before allocating.
+    let zero = builder.ins().iconst(types::I32, 0);
+    let negative = builder.ins().icmp(IntCC::SignedLessThan, length, zero);
+    trap_if(
+        module,
+        builder,
+        function,
+        negative,
+        TRAP_NEGATIVE_ARRAY_SIZE_SYMBOL,
+        &[length],
+    )?;
+    // length is now known non-negative; widen to i64 for the size arithmetic.
     let length_i64 = builder.ins().sextend(types::I64, length);
     let stride_value = builder.ins().iconst(types::I64, i64::from(stride));
     let payload = builder.ins().imul(length_i64, stride_value);
@@ -746,6 +926,13 @@ fn backend_error(function: &FunctionIr, message: &str) -> CodegenError {
     CodegenError::Backend {
         function: function_label(function),
         message: message.to_string(),
+    }
+}
+
+fn backend_message(function: &FunctionIr, message: String) -> CodegenError {
+    CodegenError::Backend {
+        function: function_label(function),
+        message,
     }
 }
 
